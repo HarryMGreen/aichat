@@ -1,4 +1,4 @@
-use super::{ExtraConfig, Model, OpenAIClient, PromptType, SendData, TokensCountFactors};
+use super::{ExtraConfig, Model, OpenAIClient, PromptType, SendData};
 
 use crate::{render::ReplyHandler, utils::PromptKind};
 
@@ -12,17 +12,17 @@ use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.openai.com/v1";
 
-const MODELS: [(&str, usize, &str); 5] = [
-    // https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo
-    ("gpt-4-turbo-preview", 128000, "text"),
-    ("gpt-4-vision-preview", 128000, "text,vision"),
-    ("gpt-4-1106-preview", 128000, "text"),
-    // https://platform.openai.com/docs/models/gpt-3-5-turbo
+const MODELS: [(&str, usize, &str); 8] = [
+    // https://platform.openai.com/docs/models
     ("gpt-3.5-turbo", 16385, "text"),
     ("gpt-3.5-turbo-1106", 16385, "text"),
+    ("gpt-4-turbo", 128000, "text,vision"),
+    ("gpt-4-turbo-preview", 128000, "text"),
+    ("gpt-4-1106-preview", 128000, "text"),
+    ("gpt-4-vision-preview", 128000, "text,vision"),
+    ("gpt-4", 8192, "text"),
+    ("gpt-4-32k", 32768, "text"),
 ];
-
-pub const OPENAI_TOKENS_COUNT_FACTORS: TokensCountFactors = (5, 2);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OpenAIConfig {
@@ -50,7 +50,6 @@ impl OpenAIClient {
                 Model::new(client_name, name)
                     .set_capabilities(capabilities.into())
                     .set_max_input_tokens(Some(max_input_tokens))
-                    .set_tokens_count_factors(OPENAI_TOKENS_COUNT_FACTORS)
             })
             .collect()
     }

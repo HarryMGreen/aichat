@@ -16,8 +16,8 @@ use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    ColumnarMenu, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline, ReedlineEvent,
-    ReedlineMenu, ValidationResult, Validator, Vi,
+    ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
+    ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
 };
 use reedline::{MenuBuilder, Signal};
 use std::{env, process};
@@ -103,6 +103,7 @@ impl Repl {
         self.banner();
 
         let mut already_ctrlc = false;
+        let ctrlc_exit = self.config.read().ctrlc_exit;
 
         loop {
             if self.abort.aborted_ctrld() {
@@ -117,8 +118,8 @@ impl Repl {
                     already_ctrlc = false;
                     self.abort.reset();
                     match self.handle(&line) {
-                        Ok(quit) => {
-                            if quit {
+                        Ok(exit) => {
+                            if exit {
                                 break;
                             }
                         }
@@ -130,11 +131,15 @@ impl Repl {
                 }
                 Ok(Signal::CtrlC) => {
                     self.abort.set_ctrlc();
-                    if already_ctrlc {
-                        break;
+                    if ctrlc_exit {
+                        if already_ctrlc {
+                            break;
+                        }
+                        already_ctrlc = true;
+                        println!("(To exit, press Ctrl+C again or Ctrl+D or type .exit)\n");
+                    } else {
+                        println!("(To exit, press Ctrl+D or type .exit)\n");
                     }
-                    already_ctrlc = true;
-                    println!("(To exit, press Ctrl+C again or Ctrl+D or type .exit)\n");
                 }
                 Ok(Signal::CtrlD) => {
                     self.abort.set_ctrld();
@@ -229,7 +234,7 @@ impl Repl {
                         let input = Input::new(text, files, self.config.read().input_context())?;
                         self.ask(input)?;
                     }
-                    None => println!("Usage: .file <files>...[ -- <text>...]"),
+                    None => println!("Usage: .file <files>... [-- <text>...]"),
                 },
                 ".exit" => match args {
                     Some("role") => {
@@ -334,6 +339,11 @@ Type ".help" for more information.
             KeyModifiers::SHIFT,
             KeyCode::BackTab,
             ReedlineEvent::MenuPrevious,
+        );
+        keybindings.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
     }
 

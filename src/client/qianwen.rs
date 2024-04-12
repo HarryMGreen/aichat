@@ -1,5 +1,5 @@
 use super::{
-    message::*, Client, ExtraConfig, Model, PromptType, QianwenClient, SendData, TokensCountFactors,
+    message::*, Client, ExtraConfig, Model, PromptType, QianwenClient, SendData,
 };
 
 use crate::{
@@ -28,16 +28,14 @@ const API_URL_VL: &str =
 
 const MODELS: [(&str, usize, &str); 6] = [
     // https://help.aliyun.com/zh/dashscope/developer-reference/api-details
+    ("qwen-turbo", 6000, "text"),
+    ("qwen-plus", 30000, "text"),
     ("qwen-max", 6000, "text"),
     ("qwen-max-longcontext", 28000, "text"),
-    ("qwen-plus", 30000, "text"),
-    ("qwen-turbo", 6000, "text"),
     // https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-qianwen-vl-plus-api
-    ("qwen-vl-max", 0, "text,vision"),
     ("qwen-vl-plus", 0, "text,vision"),
+    ("qwen-vl-max", 0, "text,vision"),
 ];
-
-const TOKENS_COUNT_FACTORS: TokensCountFactors = (4, 14);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct QianwenConfig {
@@ -88,7 +86,6 @@ impl QianwenClient {
                 Model::new(client_name, name)
                     .set_capabilities(capabilities.into())
                     .set_max_input_tokens(Some(max_input_tokens))
-                    .set_tokens_count_factors(TOKENS_COUNT_FACTORS)
             })
             .collect()
     }

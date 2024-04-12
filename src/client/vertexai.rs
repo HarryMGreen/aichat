@@ -1,6 +1,6 @@
 use super::{
-    message::*, patch_system_message, Client, ExtraConfig, Model, PromptType, SendData,
-    TokensCountFactors, VertexAIClient,
+    json_stream, message::*, patch_system_message, Client, ExtraConfig, Model, PromptType,
+    SendData, VertexAIClient,
 };
 
 use crate::{render::ReplyHandler, utils::PromptKind};
@@ -8,22 +8,17 @@ use crate::{render::ReplyHandler, utils::PromptKind};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-const MODELS: [(&str, usize, &str); 5] = [
+const MODELS: [(&str, usize, &str); 3] = [
     // https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
     ("gemini-1.0-pro", 24568, "text"),
     ("gemini-1.0-pro-vision", 14336, "text,vision"),
-    ("gemini-1.0-ultra", 8192, "text"),
-    ("gemini-1.0-ultra-vision", 8192, "text,vision"),
-    ("gemini-1.5-pro", 1000000, "text"),
+    ("gemini-1.5-pro-preview-0409", 1000000, "text,vision"),
 ];
-
-const TOKENS_COUNT_FACTORS: TokensCountFactors = (5, 2);
 
 static mut ACCESS_TOKEN: (String, i64) = (String::new(), 0); // safe under linear operation
 
@@ -72,7 +67,6 @@ impl VertexAIClient {
                 Model::new(client_name, name)
                     .set_capabilities(capabilities.into())
                     .set_max_input_tokens(Some(max_input_tokens))
-                    .set_tokens_count_factors(TOKENS_COUNT_FACTORS)
             })
             .collect()
     }
@@ -138,53 +132,12 @@ pub(crate) async fn send_message_streaming(
         let data: Value = res.json().await?;
         check_error(&data)?;
     } else {
-        let mut buffer = vec![];
-        let mut cursor = 0;
-        let mut start = 0;
-        let mut balances = vec![];
-        let mut quoting = false;
-        let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let chunk = std::str::from_utf8(&chunk)?;
-            buffer.extend(chunk.chars());
-            for i in cursor..buffer.len() {
-                let ch = buffer[i];
-                if quoting {
-                    if ch == '"' && buffer[i - 1] != '\\' {
-                        quoting = false;
-                    }
-                    continue;
-                }
-                match ch {
-                    '"' => quoting = true,
-                    '{' => {
-                        if balances.is_empty() {
-                            start = i;
-                        }
-                        balances.push(ch);
-                    }
-                    '[' => {
-                        if start != 0 {
-                            balances.push(ch);
-                        }
-                    }
-                    '}' => {
-                        balances.pop();
-                        if balances.is_empty() {
-                            let value: String = buffer[start..=i].iter().collect();
-                            let value: Value = serde_json::from_str(&value)?;
-                            handler.text(extract_text(&value)?)?;
-                        }
-                    }
-                    ']' => {
-                        balances.pop();
-                    }
-                    _ => {}
-                }
-            }
-            cursor = buffer.len();
-        }
+        let handle = |value: &str| -> Result<()> {
+            let value: Value = serde_json::from_str(value)?;
+            handler.text(extract_text(&value)?)?;
+            Ok(())
+        };
+        json_stream(res.bytes_stream(), handle).await?;
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 use super::vertexai::{build_body, send_message, send_message_streaming};
-use super::{Client, ExtraConfig, GeminiClient, Model, PromptType, SendData, TokensCountFactors};
+use super::{Client, ExtraConfig, GeminiClient, Model, PromptType, SendData};
 
 use crate::{render::ReplyHandler, utils::PromptKind};
 
@@ -10,14 +10,12 @@ use serde::Deserialize;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models/";
 
-const MODELS: [(&str, usize, &str); 2] = [
+const MODELS: [(&str, usize, &str); 3] = [
     // https://ai.google.dev/models/gemini
-    ("gemini-pro", 30720, "text"),
-    ("gemini-pro-vision", 12288, "vision"),
-    // ("gemini-1.5-pro", 1048576, "text,vision"),
+    ("gemini-1.0-pro-latest", 30720, "text"),
+    ("gemini-1.0-pro-vision-latest", 12288, "text,vision"),
+    ("gemini-1.5-pro-latest", 1048576, "text,vision"),
 ];
-
-const TOKENS_COUNT_FACTORS: TokensCountFactors = (5, 2);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GeminiConfig {
@@ -61,7 +59,6 @@ impl GeminiClient {
                 Model::new(client_name, name)
                     .set_capabilities(capabilities.into())
                     .set_max_input_tokens(Some(max_input_tokens))
-                    .set_tokens_count_factors(TOKENS_COUNT_FACTORS)
             })
             .collect()
     }

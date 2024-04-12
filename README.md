@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/sigoden/aichat/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/aichat/actions/workflows/ci.yaml)
 [![Crates](https://img.shields.io/crates/v/aichat.svg)](https://crates.io/crates/aichat)
+[![Discord](https://img.shields.io/discord/1226737085453701222?label=Discord)](https://discord.gg/NYmfN6CA)
 
-All-in-one CLI tool for 10+ AI platforms, including OpenAI, Gemini, Claude, Mistral, Ollama, VertexAI, Ernie, Qianwen, Moonshot...
+All-in-one chat and copilot CLI that integrates 10+ AI platforms.
 
 Command Mode:
 
@@ -12,6 +13,32 @@ Command Mode:
 Chat REPL mode:
 
 ![chat-repl mode](https://github.com/sigoden/aichat/assets/4012553/13427d54-efd5-4f4c-b17b-409edd30dfa3)
+
+## Features
+
+- Supports [chat-REPL](#chat-repl)
+- Supports [roles](#roles)
+- Supports sessions (context-aware conversation)
+- Supports image analysis (vision)
+- [Shell commands](#shell-commands): Execute commands using natural language
+- [Shell integration](#shell-integration): AI-powered shell autocompletion
+- [Custom theme](https://github.com/sigoden/aichat/wiki/Custom-Theme)
+- Stream/non-stream output
+
+## Integrated platforms
+
+- OpenAI: GPT3.5/GPT4 (paid, vision)
+- Azure-OpenAI (paid)
+- OpenAI-Compatible platforms
+- Gemini: Gemini-1.0/Gemini-1.5 (free, vision)
+- VertexAI (paid, vision)
+- Claude: Claude3 (vision, paid)
+- Mistral (paid)
+- Cohere (paid)
+- Ollama (free, local)
+- Ernie (paid)
+- Qianwen (paid, vision)
+- Moonshot (paid)
 
 ## Install
 
@@ -41,31 +68,6 @@ pkg install aichat
 
 Download it from [GitHub Releases](https://github.com/sigoden/aichat/releases), unzip, and add aichat to your `$PATH`.
 
-## Features
-- Support most of the LLM platforms
-  - OpenAI: GPT3.5/GPT4 (paid, vision)
-  - Gemini (free, vision)
-  - Claude: Claude2/Claude3 (paid)
-  - Mistral (paid)
-  - OpenAI-Compatible (local)
-  - Ollama (free, local)
-  - Azure-OpenAI (paid)
-  - VertexAI: Gemini-1/Gemini-1.5 (paid, vision)
-  - Ernie (paid)
-  - Qianwen (paid, vision)
-  - Moonshot (paid)
-- Support [Command Mode](#command) and [Chat-REPL Mode](#chat-repl)
-- Support [roles](#roles)
-- Support sessions (context-aware conversation)
-- Support multimodal models (vision)
-- Execute commands using natural language
-- Shell integration
-- Syntax highlighting for markdown and 200+ languages in code blocks
-- Save messages/sessions
-- Stream/Non-stream output
-- [Custom theme](https://github.com/sigoden/aichat/wiki/Custom-Theme)
-- With proxy
-
 ## Config
 
 On first launch, aichat will guide you through the configuration.
@@ -87,6 +89,7 @@ highlight: true                  # Set false to turn highlight
 light_theme: false               # Whether to use a light theme
 wrap: no                         # Specify the text-wrapping mode (no, auto, <max-width>)
 wrap_code: false                 # Whether wrap code block
+ctrlc_exit: false                # Whether to exit REPL when Ctrl+C is pressed
 auto_copy: false                 # Automatically copy the last output to the clipboard
 keybindings: emacs               # REPL keybindings. values: emacs, vi
 prelude: ''                      # Set a default role or session (role:<name>, session:<name>)
@@ -104,9 +107,9 @@ clients:
         max_input_tokens: 8192
 ```
 
-Take a look at the [config.example.yaml](config.example.yaml) for the complete configuration details.
+Please review the [config.example.yaml](config.example.yaml) to see all available configuration options.
 
-There are some configurations that can be set through environment variables. For more information, please refer to the [Environment Variables](https://github.com/sigoden/aichat/wiki/Environment-Variables) page.
+There are some configurations that can be set through environment variables, see [Environment Variables](https://github.com/sigoden/aichat/wiki/Environment-Variables).
 
 ## Command
 
@@ -122,7 +125,7 @@ Options:
   -s, --session [<SESSION>]  Create or reuse a session
   -e, --execute              Execute commands using natural language
   -c, --code                 Generate only code
-  -f, --file <FILE>...       Attach files to the message to be sent
+  -f, --file <FILE>          Attach files to the message
   -H, --no-highlight         Disable syntax highlighting
   -S, --no-stream            No stream output
   -w, --wrap <WRAP>          Specify the text-wrapping mode (no, auto, <max-width>)
@@ -151,17 +154,19 @@ aichat --info                                   # System info
 aichat -r role1 --info                          # Role info
 aichat -s session1 --info                       # Session info
 
-cat data.toml | aichat -c to json > data.json   # Pipe IO
+cat data.toml | aichat -c to json > data.json   # Pipe stdio/stdout
 
-aichat --file a.png b.png -- diff images        # Attach files
+aichat -f data.toml -c to json > data.json      # Attach files
+
+aichat -f a.png -f b.png diff images            # Attach images
 ```
 
-### Execute commands using natural language
+### Shell commands
 
 Simply input what you want to do in natural language, and aichat will prompt and run the command that achieves your intent.
 
 ```
-aichat -s <text>...
+aichat -e <text>...
 ```
 
 Aichat is aware of OS and `$SHELL` you are using, it will provide shell command for specific system you have. For instance, if you ask `aichat` to update your system, it will return a command based on your OS. Here's an example using macOS:
@@ -200,7 +205,7 @@ This is a **very handy feature**, which allows you to use `aichat` shell complet
 
 To install shell integration, go to [./scripts/shell-integration](https://github.com/sigoden/aichat/tree/main/scripts/shell-integration) to download the script and source the script in rc file. After that restart your shell. You can invoke the completion with `alt+e` hotkey.
 
-## Generate Code
+### Generating code
 
 By using the `--code` or `-c` parameter, you can specifically request pure code output, for instance:
 
@@ -232,17 +237,20 @@ aichat --code a echo server in node.js > echo-server.js
 node echo-server.js
 ```
 
+**The `-c/--code` option ensures the extraction of code from Markdown.**
+
 ## Chat REPL
 
-aichat has a powerful Chat REPL.
+Aichat has a powerful Chat REPL.
 
 The REPL supports:
 
-- Tab autocomplete
+- Tab autocompletion
 - [Custom REPL Prompt](https://github.com/sigoden/aichat/wiki/Custom-REPL-Prompt)
 - Emacs/Vi keybinding
-- Edit/paste multiline text
+- Edit/paste multi-line text
 - Open an editor to modify the current prompt
+- History
 - Undo support
 
 ### `.help` - print help message
@@ -412,7 +420,7 @@ For example, we can define a role:
     Do not provide explanations.
 ```
 
-Let ChatGPT answer questions in the role of a Linux shell expert.
+Let LLM answer questions in the role of a Linux shell expert.
 
 ```
 > .role shell
@@ -420,15 +428,6 @@ Let ChatGPT answer questions in the role of a Linux shell expert.
 shell>  extract encrypted zipfile app.zip to /tmp/app
 mkdir /tmp/app
 unzip -P PASSWORD app.zip -d /tmp/app
-```
-
-AIChat with roles will be a universal tool.
-
-```
-$ aichat --role shell extract encrypted zipfile app.zip to /tmp/app
-unzip -P password app.zip -d /tmp/app
-
-$ cat README.md | aichat --role spellcheck
 ```
 
 For more details about roles, please visit [Role Guide](https://github.com/sigoden/aichat/wiki/Role-Guide).
