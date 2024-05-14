@@ -1,9 +1,9 @@
+use super::access_token::*;
 use super::{
-    json_stream, message::*, patch_system_message, Client, ExtraConfig, Model, PromptType,
-    SendData, VertexAIClient,
+    catch_error, json_stream, message::*, patch_system_message, Client, CompletionDetails,
+    ExtraConfig, Model, ModelConfig, PromptAction, PromptKind, SendData, SseHandler,
+    VertexAIClient,
 };
-
-use crate::{render::ReplyHandler, utils::PromptKind};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -13,128 +13,100 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-const MODELS: [(&str, usize, &str); 3] = [
-    // https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-    ("gemini-1.0-pro", 24568, "text"),
-    ("gemini-1.0-pro-vision", 14336, "text,vision"),
-    ("gemini-1.5-pro-preview-0409", 1000000, "text,vision"),
-];
-
-static mut ACCESS_TOKEN: (String, i64) = (String::new(), 0); // safe under linear operation
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct VertexAIConfig {
     pub name: Option<String>,
-    pub api_base: Option<String>,
+    pub project_id: Option<String>,
+    pub location: Option<String>,
     pub adc_file: Option<String>,
-    pub block_threshold: Option<String>,
+    #[serde(rename = "safetySettings")]
+    pub safety_settings: Option<Value>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
+}
+
+impl VertexAIClient {
+    config_get_fn!(project_id, get_project_id);
+    config_get_fn!(location, get_location);
+
+    pub const PROMPTS: [PromptAction<'static>; 2] = [
+        ("project_id", "Project ID", true, PromptKind::String),
+        ("location", "Location", true, PromptKind::String),
+    ];
+
+    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+        let project_id = self.get_project_id()?;
+        let location = self.get_location()?;
+        let access_token = get_access_token(self.name())?;
+
+        let base_url = format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers");
+
+        let func = match data.stream {
+            true => "streamGenerateContent",
+            false => "generateContent",
+        };
+        let url = format!("{base_url}/google/models/{}:{func}", self.model.name);
+
+        let body = gemini_build_body(data, &self.model, self.config.safety_settings.clone())?;
+
+        debug!("VertexAI Request: {url} {body}");
+
+        let builder = client.post(url).bearer_auth(access_token).json(&body);
+
+        Ok(builder)
+    }
 }
 
 #[async_trait]
 impl Client for VertexAIClient {
     client_common_fns!();
 
-    async fn send_message_inner(&self, client: &ReqwestClient, data: SendData) -> Result<String> {
-        self.prepare_access_token().await?;
+    async fn send_message_inner(
+        &self,
+        client: &ReqwestClient,
+        data: SendData,
+    ) -> Result<(String, CompletionDetails)> {
+        prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let builder = self.request_builder(client, data)?;
-        send_message(builder).await
+        gemini_send_message(builder).await
     }
 
     async fn send_message_streaming_inner(
         &self,
         client: &ReqwestClient,
-        handler: &mut ReplyHandler,
+        handler: &mut SseHandler,
         data: SendData,
     ) -> Result<()> {
-        self.prepare_access_token().await?;
+        prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler).await
+        gemini_send_message_streaming(builder, handler).await
     }
 }
 
-impl VertexAIClient {
-    config_get_fn!(api_base, get_api_base);
-
-    pub const PROMPTS: [PromptType<'static>; 1] =
-        [("api_base", "API Base:", true, PromptKind::String)];
-
-    pub fn list_models(local_config: &VertexAIConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, max_input_tokens, capabilities)| {
-                Model::new(client_name, name)
-                    .set_capabilities(capabilities.into())
-                    .set_max_input_tokens(Some(max_input_tokens))
-            })
-            .collect()
-    }
-
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
-        let api_base = self.get_api_base()?;
-
-        let func = match data.stream {
-            true => "streamGenerateContent",
-            false => "generateContent",
-        };
-
-        let block_threshold = self.config.block_threshold.clone();
-
-        let body = build_body(data, self.model.name.clone(), block_threshold)?;
-
-        let model = self.model.name.clone();
-
-        let url = format!("{api_base}/{}:{}", model, func);
-
-        debug!("VertexAI Request: {url} {body}");
-
-        let builder = client
-            .post(url)
-            .bearer_auth(unsafe { &ACCESS_TOKEN.0 })
-            .json(&body);
-
-        Ok(builder)
-    }
-
-    async fn prepare_access_token(&self) -> Result<()> {
-        if unsafe { ACCESS_TOKEN.0.is_empty() || Utc::now().timestamp() > ACCESS_TOKEN.1 } {
-            let client = self.build_client()?;
-            let (token, expires_in) = fetch_access_token(&client, &self.config.adc_file)
-                .await
-                .with_context(|| "Failed to fetch access token")?;
-            let expires_at = Utc::now()
-                + Duration::try_seconds(expires_in)
-                    .ok_or_else(|| anyhow!("Failed to parse expires_in of access_token"))?;
-            unsafe { ACCESS_TOKEN = (token, expires_at.timestamp()) };
-        }
-        Ok(())
-    }
-}
-
-pub(crate) async fn send_message(builder: RequestBuilder) -> Result<String> {
+pub async fn gemini_send_message(builder: RequestBuilder) -> Result<(String, CompletionDetails)> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
-    if status != 200 {
-        check_error(&data)?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
     }
-    let output = extract_text(&data)?;
-    Ok(output.to_string())
+    gemini_extract_completion_text(&data)
 }
 
-pub(crate) async fn send_message_streaming(
+pub async fn gemini_send_message_streaming(
     builder: RequestBuilder,
-    handler: &mut ReplyHandler,
+    handler: &mut SseHandler,
 ) -> Result<()> {
     let res = builder.send().await?;
-    if res.status() != 200 {
+    let status = res.status();
+    if !status.is_success() {
         let data: Value = res.json().await?;
-        check_error(&data)?;
+        catch_error(&data, status.as_u16())?;
     } else {
         let handle = |value: &str| -> Result<()> {
             let value: Value = serde_json::from_str(value)?;
-            handler.text(extract_text(&value)?)?;
+            handler.text(gemini_extract_text(&value)?)?;
             Ok(())
         };
         json_stream(res.bytes_stream(), handle).await?;
@@ -142,7 +114,17 @@ pub(crate) async fn send_message_streaming(
     Ok(())
 }
 
-fn extract_text(data: &Value) -> Result<&str> {
+fn gemini_extract_completion_text(data: &Value) -> Result<(String, CompletionDetails)> {
+    let text = gemini_extract_text(data)?;
+    let details = CompletionDetails {
+        id: None,
+        input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
+        output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+    };
+    Ok((text.to_string(), details))
+}
+
+fn gemini_extract_text(data: &Value) -> Result<&str> {
     match data["candidates"][0]["content"]["parts"][0]["text"].as_str() {
         Some(text) => Ok(text),
         None => {
@@ -150,7 +132,7 @@ fn extract_text(data: &Value) -> Result<&str> {
                 .as_str()
                 .or_else(|| data["candidates"][0]["finishReason"].as_str())
             {
-                bail!("Blocked by safety settings，consider adjusting `block_threshold` in the client configuration")
+                bail!("Blocked by safety settings，consider adjusting `safetySettings` in the client configuration")
             } else {
                 bail!("Invalid response data: {data}")
             }
@@ -158,31 +140,16 @@ fn extract_text(data: &Value) -> Result<&str> {
     }
 }
 
-fn check_error(data: &Value) -> Result<()> {
-    if let Some((Some(status), Some(message))) = data[0]["error"].as_object().map(|v| {
-        (
-            v.get("status").and_then(|v| v.as_str()),
-            v.get("message").and_then(|v| v.as_str()),
-        )
-    }) {
-        if status == "UNAUTHENTICATED" {
-            unsafe { ACCESS_TOKEN = (String::new(), 0) }
-        }
-        bail!("{status}: {message}")
-    } else {
-        bail!("Error {}", data);
-    }
-}
-
-pub(crate) fn build_body(
+pub(crate) fn gemini_build_body(
     data: SendData,
-    _model: String,
-    block_threshold: Option<String>,
+    model: &Model,
+    safety_settings: Option<Value>,
 ) -> Result<Value> {
     let SendData {
         mut messages,
         temperature,
-        ..
+        top_p,
+        stream: _,
     } = data;
 
     patch_system_message(&mut messages);
@@ -228,24 +195,40 @@ pub(crate) fn build_body(
         );
     }
 
-    let mut body = json!({ "contents": contents });
+    let mut body = json!({ "contents": contents, "generationConfig": {} });
 
-    if let Some(block_threshold) = block_threshold {
-        body["safetySettings"] = json!([
-            {"category":"HARM_CATEGORY_HARASSMENT","threshold":block_threshold},
-            {"category":"HARM_CATEGORY_HATE_SPEECH","threshold":block_threshold},
-            {"category":"HARM_CATEGORY_SEXUALLY_EXPLICIT","threshold":block_threshold},
-            {"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":block_threshold}
-        ]);
+    if let Some(safety_settings) = safety_settings {
+        body["safetySettings"] = safety_settings;
     }
 
-    if let Some(temperature) = temperature {
-        body["generationConfig"] = json!({
-            "temperature": temperature,
-        });
+    if let Some(v) = model.max_tokens_param() {
+        body["generationConfig"]["maxOutputTokens"] = v.into();
+    }
+    if let Some(v) = temperature {
+        body["generationConfig"]["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["generationConfig"]["topP"] = v.into();
     }
 
     Ok(body)
+}
+
+pub async fn prepare_gcloud_access_token(
+    client: &reqwest::Client,
+    client_name: &str,
+    adc_file: &Option<String>,
+) -> Result<()> {
+    if !is_valid_access_token(client_name) {
+        let (token, expires_in) = fetch_access_token(client, adc_file)
+            .await
+            .with_context(|| "Failed to fetch access token")?;
+        let expires_at = Utc::now()
+            + Duration::try_seconds(expires_in)
+                .ok_or_else(|| anyhow!("Failed to parse expires_in of access_token"))?;
+        set_access_token(client_name, token, expires_at.timestamp())
+    }
+    Ok(())
 }
 
 async fn fetch_access_token(
@@ -268,7 +251,7 @@ async fn fetch_access_token(
     } else if let Some(err_msg) = value["error_description"].as_str() {
         bail!("{err_msg}")
     } else {
-        bail!("Invalid response data")
+        bail!("Invalid response data: {value}")
     }
 }
 

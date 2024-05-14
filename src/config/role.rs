@@ -1,3 +1,4 @@
+use super::Input;
 use crate::{
     client::{Message, MessageContent, MessageRole},
     utils::{detect_os, detect_shell},
@@ -6,77 +7,65 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::Input;
+pub const TEMP_ROLE: &str = "%%";
+pub const SHELL_ROLE: &str = "%shell%";
+pub const EXPLAIN_SHELL_ROLE: &str = "%explain-shell%";
+pub const CODE_ROLE: &str = "%code%";
 
-const INPUT_PLACEHOLDER: &str = "__INPUT__";
+pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Role {
-    /// Role name
     pub name: String,
-    /// Prompt text
     pub prompt: String,
-    /// Temperature value
     pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
 }
 
 impl Role {
-    pub const EXECUTE: &'static str = "__execute__";
-    pub const DESCRIBE_COMMAND: &'static str = "__describe_command__";
-    pub const CODE: &'static str = "__code__";
-
-    pub fn for_execute() -> Self {
-        let os = detect_os();
-        let (shell, _, _) = detect_shell();
-        let (shell, use_semicolon) = match (shell.as_str(), os.as_str()) {
-            ("nushell", "windows") => ("cmd", true),
-            ("nushell", _) => ("bash", true),
-            ("powershell", _) => ("powershell", true),
-            ("pwsh", _) => ("powershell", false),
-            _ => (shell.as_str(), false),
-        };
-        let combine = if use_semicolon {
-            "\nIf multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
-        } else {
-            "\nIf multiple steps required try to combine them together using &&.".to_string()
-        };
+    pub fn temp(prompt: &str) -> Self {
         Self {
-            name: Self::EXECUTE.into(),
-            prompt: format!(
-                r#"Provide only {shell} commands for {os} without any description.
-Ensure the output is a valid {shell} command. {combine}
-If there is a lack of details, provide most logical solution.
-Provide only plain text without Markdown formatting.
-Do not provide markdown formatting such as ```"#
-            ),
+            name: TEMP_ROLE.into(),
+            prompt: prompt.into(),
             temperature: None,
+            top_p: None,
         }
     }
 
-    pub fn for_describe_command() -> Self {
-        Self {
-            name: Self::DESCRIBE_COMMAND.into(),
-            prompt: r#"Provide a terse, single sentence description of the given shell command.
+    pub fn builtin() -> Vec<Role> {
+        [
+            (SHELL_ROLE, shell_prompt()),
+            (
+                EXPLAIN_SHELL_ROLE,
+                r#"Provide a terse, single sentence description of the given shell command.
 Describe each argument and option of the command.
 Provide short responses in about 80 words.
 APPLY MARKDOWN formatting when possible."#
+                    .into(),
+            ),
+            (
+                CODE_ROLE,
+                r#"Provide only code without comments or explanations.
+### INPUT:
+async sleep in js
+### OUTPUT:
+```javascript
+async function timeout(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+```
+"#
                 .into(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, prompt)| Self {
+            name: name.into(),
+            prompt,
             temperature: None,
-        }
-    }
-
-    pub fn for_code() -> Self {
-        Self {
-            name: Self::CODE.into(),
-            prompt: r#"Provide only code as output without any description.
-Provide only code in plain text format without Markdown formatting.
-Do not include symbols such as ``` or ```python.
-If there is a lack of details, provide most logical solution.
-You are not allowed to ask for more details.
-For example if the prompt is "Hello world Python", you should return "print('Hello world')"."#
-                .into(),
-            temperature: None,
-        }
+            top_p: None,
+        })
+        .collect()
     }
 
     pub fn export(&self) -> Result<String> {
@@ -91,6 +80,10 @@ For example if the prompt is "Hello world Python", you should return "print('Hel
 
     pub fn set_temperature(&mut self, value: Option<f64>) {
         self.temperature = value;
+    }
+
+    pub fn set_top_p(&mut self, value: Option<f64>) {
+        self.top_p = value;
     }
 
     pub fn complete_prompt_args(&mut self, name: &str) {
@@ -127,16 +120,33 @@ For example if the prompt is "Hello world Python", you should return "print('Hel
                 content,
             }]
         } else {
-            vec![
-                Message {
+            let mut messages = vec![];
+            let (system, cases) = parse_structure_prompt(&self.prompt);
+            if !system.is_empty() {
+                messages.push(Message {
                     role: MessageRole::System,
-                    content: MessageContent::Text(self.prompt.clone()),
-                },
-                Message {
-                    role: MessageRole::User,
-                    content,
-                },
-            ]
+                    content: MessageContent::Text(system.to_string()),
+                })
+            }
+            if !cases.is_empty() {
+                messages.extend(cases.into_iter().flat_map(|(i, o)| {
+                    vec![
+                        Message {
+                            role: MessageRole::User,
+                            content: MessageContent::Text(i.to_string()),
+                        },
+                        Message {
+                            role: MessageRole::Assistant,
+                            content: MessageContent::Text(o.to_string()),
+                        },
+                    ]
+                }));
+            }
+            messages.push(Message {
+                role: MessageRole::User,
+                content,
+            });
+            messages
         }
     }
 }
@@ -147,6 +157,78 @@ fn complete_prompt_args(prompt: &str, name: &str) -> String {
         prompt = prompt.replace(&format!("__ARG{}__", i + 1), arg);
     }
     prompt
+}
+
+fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
+    let mut text = prompt;
+    let mut search_input = true;
+    let mut system = None;
+    let mut parts = vec![];
+    loop {
+        let search = if search_input {
+            "### INPUT:"
+        } else {
+            "### OUTPUT:"
+        };
+        match text.find(search) {
+            Some(idx) => {
+                if system.is_none() {
+                    system = Some(&text[..idx])
+                } else {
+                    parts.push(&text[..idx])
+                }
+                search_input = !search_input;
+                text = &text[(idx + search.len())..];
+            }
+            None => {
+                if !text.is_empty() {
+                    if system.is_none() {
+                        system = Some(text)
+                    } else {
+                        parts.push(text)
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let parts_len = parts.len();
+    if parts_len > 0 && parts_len % 2 == 0 {
+        let cases: Vec<(&str, &str)> = parts
+            .iter()
+            .step_by(2)
+            .zip(parts.iter().skip(1).step_by(2))
+            .map(|(i, o)| (i.trim(), o.trim()))
+            .collect();
+        let system = system.map(|v| v.trim()).unwrap_or_default();
+        return (system, cases);
+    }
+
+    (prompt, vec![])
+}
+
+fn shell_prompt() -> String {
+    let os = detect_os();
+    let (detected_shell, _, _) = detect_shell();
+    let (shell, use_semicolon) = match (detected_shell.as_str(), os.as_str()) {
+        // GPT doesn’t know much about nushell
+        ("nushell", "windows") => ("cmd", true),
+        ("nushell", _) => ("bash", true),
+        ("powershell", _) => ("powershell", true),
+        ("pwsh", _) => ("powershell", false),
+        _ => (detected_shell.as_str(), false),
+    };
+    let combine = if use_semicolon {
+        "\nIf multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
+    } else {
+        "\nIf multiple steps required try to combine them together using '&&'.".to_string()
+    };
+    format!(
+        r#"Provide only {shell} commands for {os} without any description.
+Ensure the output is a valid {shell} command. {combine}
+If there is a lack of details, provide most logical solution.
+Output plain text only, without any markdown formatting."#
+    )
 }
 
 #[cfg(test)]
@@ -163,5 +245,44 @@ mod tests {
             complete_prompt_args("convert __ARG1__ to __ARG2__", "convert:foo:bar"),
             "convert foo to bar"
         );
+    }
+
+    #[test]
+    fn test_parse_structure_prompt1() {
+        let prompt = r#"
+System message
+### INPUT:
+Input 1
+### OUTPUT:
+Output 1
+"#;
+        assert_eq!(
+            parse_structure_prompt(prompt),
+            ("System message", vec![("Input 1", "Output 1")])
+        );
+    }
+
+    #[test]
+    fn test_parse_structure_prompt2() {
+        let prompt = r#"
+### INPUT:
+Input 1
+### OUTPUT:
+Output 1
+"#;
+        assert_eq!(
+            parse_structure_prompt(prompt),
+            ("", vec![("Input 1", "Output 1")])
+        );
+    }
+
+    #[test]
+    fn test_parse_structure_prompt3() {
+        let prompt = r#"
+System message
+### INPUT:
+Input 1
+"#;
+        assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
     }
 }

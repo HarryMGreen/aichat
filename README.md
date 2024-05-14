@@ -1,99 +1,101 @@
-# AIChat
+# Aichat: All-in-one AI-Powered CLI Chat & Copilot
 
 [![CI](https://github.com/sigoden/aichat/actions/workflows/ci.yaml/badge.svg)](https://github.com/sigoden/aichat/actions/workflows/ci.yaml)
 [![Crates](https://img.shields.io/crates/v/aichat.svg)](https://crates.io/crates/aichat)
-[![Discord](https://img.shields.io/discord/1226737085453701222?label=Discord)](https://discord.gg/NYmfN6CA)
+[![Discord](https://img.shields.io/discord/1226737085453701222?label=Discord)](https://discord.gg/mr3ZZUB9hG)
 
-All-in-one chat and copilot CLI that integrates 10+ AI platforms.
+AIChat is a cutting-edge CLI chat and copilot tool that seamlessly integrates with over 10 leading AI platforms, providing a powerful combination of chat-based interaction, context-aware conversations, and AI-assisted shell capabilities, all within a customizable and user-friendly environment.
 
-Command Mode:
+![AIChat Command](https://github.com/sigoden/aichat/assets/4012553/84ae8382-62be-41d0-a0f1-101b113c5bc7)
 
-![command mode](https://github.com/sigoden/aichat/assets/4012553/2ab27e1b-4078-4ea3-a98f-591b36491685)
+![AIChat Chat-REPL](https://github.com/sigoden/aichat/assets/4012553/13470451-9502-4b3e-b49a-e66aa7760208)
 
-Chat REPL mode:
+## Key Features
 
-![chat-repl mode](https://github.com/sigoden/aichat/assets/4012553/13427d54-efd5-4f4c-b17b-409edd30dfa3)
-
-## Features
-
-- Supports [chat-REPL](#chat-repl)
-- Supports [roles](#roles)
-- Supports sessions (context-aware conversation)
-- Supports image analysis (vision)
+- Integrate with 20+ AI platforms
+- Support [Chat-REPL](#chat-repl)
+- Support [Roles](#defining-roles)
+- Support sessions (context-aware conversation)
+- Support image analysis (vision)
 - [Shell commands](#shell-commands): Execute commands using natural language
-- [Shell integration](#shell-integration): AI-powered shell autocompletion
-- [Custom theme](https://github.com/sigoden/aichat/wiki/Custom-Theme)
-- Stream/non-stream output
+- [Shell integration](#shell-integration): AI-based shell auto-completion
+- Support extensive configuration and theme customization
+- Support stream/non-stream
+- Provide access to all LLMs using OpenAI format API
+- Host LLM playground/arena web applications
 
-## Integrated platforms
+## Supported AI Platforms
 
-- OpenAI: GPT3.5/GPT4 (paid, vision)
-- Azure-OpenAI (paid)
-- OpenAI-Compatible platforms
-- Gemini: Gemini-1.0/Gemini-1.5 (free, vision)
-- VertexAI (paid, vision)
-- Claude: Claude3 (vision, paid)
+- OpenAI GPT-3.5/GPT-4 (paid, vision)
+- Gemini: Gemini-1.0/Gemini-1.5 (free, paid, vision)
+- Claude: Claude-3 (vision, paid)
 - Mistral (paid)
-- Cohere (paid)
+- Cohere: Command-R/Command-R+ (paid)
+- Perplexity: Llama-3/Mixtral (paid)
+- Groq: Llama-3/Mixtral/Gemma (free)
 - Ollama (free, local)
+- Azure OpenAI (paid)
+- VertexAI: Gemini-1.0/Gemini-1.5 (paid, vision)
+- VertexAI-Claude: Claude-3 (paid, vision)
+- Bedrock: Llama-3/Claude-3/Mistral (paid, vision)
+- Cloudflare (free, paid, vision)
+- Replicate (paid)
 - Ernie (paid)
 - Qianwen (paid, vision)
 - Moonshot (paid)
+- ZhipuAI: GLM-3.5/GLM-4 (paid, vision)
+- Deepseek (paid)
+- Other openAI-compatible platforms
 
 ## Install
 
-### Use a package management tool
+### Package Managers
 
-For Rust programmer
-```sh
-cargo install aichat
-```
+- **Rust Developers:** `cargo install aichat`
+- **Homebrew/Linuxbrew Users:** `brew install aichat`
+- **Pacman Users**: `yay -S aichat`
+- **Windows Scoop Users:** `scoop install aichat`
+- **Android Termux Users:** `pkg install aichat`
 
-For macOS Homebrew or a Linuxbrew user
-```sh
-brew install aichat
-```
+### Pre-built Binaries
 
-For Windows Scoop user
-```sh
-scoop install aichat
-```
+Download pre-built binaries for macOS, Linux, and Windows from [GitHub Releases](https://github.com/sigoden/aichat/releases), extract them, and add the `aichat` binary to your `$PATH`.
 
-For Android Termux user
-```sh
-pkg install aichat
-```
+## Configuration
 
-### Binaries for macOS, Linux, and Windows
-
-Download it from [GitHub Releases](https://github.com/sigoden/aichat/releases), unzip, and add aichat to your `$PATH`.
-
-## Config
-
-On first launch, aichat will guide you through the configuration.
+Upon first launch, AIChat will guide you through the configuration process. An example configuration file is provided below:
 
 ```
 > No config file, create a new one? Yes
 > AI Platform: openai
 > API Key: <your_api_key_here>
+✨ Saved config file to <user-config-dir>/aichat/config.yaml
 ```
 
 Feel free to adjust the configuration according to your needs.
 
+> 💡 Use the `AICHAT_CONFIG_DIR` environment variable to custom the config dir for aichat files.
+
 ```yaml
-model: openai:gpt-3.5-turbo      # LLM model
-temperature: 1.0                 # LLM temperature
-save: true                       # Whether to save the message
-save_session: null               # Whether to save the session, if null, asking
-highlight: true                  # Set false to turn highlight
-light_theme: false               # Whether to use a light theme
-wrap: no                         # Specify the text-wrapping mode (no, auto, <max-width>)
-wrap_code: false                 # Whether wrap code block
-ctrlc_exit: false                # Whether to exit REPL when Ctrl+C is pressed
-auto_copy: false                 # Automatically copy the last output to the clipboard
-keybindings: emacs               # REPL keybindings. values: emacs, vi
-prelude: ''                      # Set a default role or session (role:<name>, session:<name>)
-compress_threshold: 1000         # Compress session if tokens exceed this value (valid when >=1000)
+model: openai:gpt-3.5-turbo      # Specify the language model to use
+temperature: null                # Set default temperature parameter
+top_p: null                      # Set default top-p parameter
+save: true                       # Indicates whether to persist the message
+save_session: null               # Controls the persistence of the session, if null, asking the user
+highlight: true                  # Controls syntax highlighting
+light_theme: false               # Activates a light color theme when true
+wrap: no                         # Controls text wrapping (no, auto, <max-width>)
+wrap_code: false                 # Enables or disables wrapping of code blocks
+auto_copy: false                 # Enables or disables automatic copying the last LLM response to the clipboard 
+keybindings: emacs               # Choose keybinding style (emacs, vi)
+prelude: null                    # Set a default role or session to start with (role:<name>, session:<name>)
+
+# Command that will be used to edit the current line buffer with ctrl+o
+# if unset fallback to $EDITOR and $VISUAL
+buffer_editor: null
+
+# Compress session when token count reaches or exceeds this threshold (must be at least 1000)
+compress_threshold: 1000
 
 clients:
   - type: openai
@@ -103,15 +105,15 @@ clients:
     name: localai
     api_base: http://127.0.0.1:8080/v1
     models:
-      - name: llama2
+      - name: llama3
         max_input_tokens: 8192
+
+  ...
 ```
 
-Please review the [config.example.yaml](config.example.yaml) to see all available configuration options.
+Refer to the [config.example.yaml](config.example.yaml) file for a complete list of configuration options.
 
-There are some configurations that can be set through environment variables, see [Environment Variables](https://github.com/sigoden/aichat/wiki/Environment-Variables).
-
-## Command
+## Command line
 
 ```
 Usage: aichat [OPTIONS] [TEXT]...
@@ -120,18 +122,21 @@ Arguments:
   [TEXT]...  Input text
 
 Options:
-  -m, --model <MODEL>        Choose a LLM model
-  -r, --role <ROLE>          Choose a role
-  -s, --session [<SESSION>]  Create or reuse a session
-  -e, --execute              Execute commands using natural language
-  -c, --code                 Generate only code
-  -f, --file <FILE>          Attach files to the message
-  -H, --no-highlight         Disable syntax highlighting
-  -S, --no-stream            No stream output
-  -w, --wrap <WRAP>          Specify the text-wrapping mode (no, auto, <max-width>)
+  -m, --model <MODEL>        Select a LLM model
+      --prompt <PROMPT>      Use the system prompt
+  -r, --role <ROLE>          Select a role
+  -s, --session [<SESSION>]  Start or join a session
+      --save-session         Forces the session to be saved
+      --serve [<ADDRESS>]    Serve the LLM API and WebAPP
+  -e, --execute              Execute commands in natural language
+  -c, --code                 Output code only
+  -f, --file <FILE>          Include files with the message
+  -H, --no-highlight         Turn off syntax highlighting
+  -S, --no-stream            Turns off stream mode
+  -w, --wrap <WRAP>          Control text wrapping (no, auto, <max-width>)
       --light-theme          Use light theme
-      --dry-run              Run in dry run mode
-      --info                 Print related information
+      --dry-run              Display the message without sending it
+      --info                 Display information
       --list-models          List all available models
       --list-roles           List all available roles
       --list-sessions        List all available sessions
@@ -142,7 +147,7 @@ Options:
 Here are some practical examples:
 
 ```sh
-aichat                                          # Start in REPL mode
+aichat                                          # Start REPL
 
 aichat -e install nvim                          # Execute
 aichat -c fibonacci in js                       # Code
@@ -150,15 +155,15 @@ aichat -c fibonacci in js                       # Code
 aichat -s                                       # REPL + New session
 aichat -s session1                              # REPL + New/Reuse 'session1'
 
-aichat --info                                   # System info
-aichat -r role1 --info                          # Role info
-aichat -s session1 --info                       # Session info
+aichat --info                                   # View system info
+aichat -r role1 --info                          # View role info
+aichat -s session1 --info                       # View session info
 
 cat data.toml | aichat -c to json > data.json   # Pipe stdio/stdout
 
-aichat -f data.toml -c to json > data.json      # Attach files
+aichat -f data.toml -c to json > data.json      # Send files
 
-aichat -f a.png -f b.png diff images            # Attach images
+aichat -f a.png -f b.png diff images            # Send images
 ```
 
 ### Shell commands
@@ -169,32 +174,19 @@ Simply input what you want to do in natural language, and aichat will prompt and
 aichat -e <text>...
 ```
 
-Aichat is aware of OS and `$SHELL` you are using, it will provide shell command for specific system you have. For instance, if you ask `aichat` to update your system, it will return a command based on your OS. Here's an example using macOS:
+![aichat-execute](https://github.com/sigoden/aichat/assets/4012553/a52edf31-b642-4bf9-8454-128ba2c387df)
 
-```sh
-aichat -e update my system
-# sudo softwareupdate -i -a
-# ? [e]xecute, [d]escribe, [a]bort:  (e)  
+AIChat is aware of OS and shell  you are using, it will provide shell command for specific system you have. For instance, if you ask `aichat` to update your system, it will return a command based on your OS. Here's an example using macOS:
+
+```
+$ aichat -e update my system
+? sudo softwareupdate -i -a
 ```
 
 The same prompt, when used on Ubuntu, will generate a different suggestion:
-```sh
- aichat -e update my system
-# sudo apt update && sudo apt upgrade -y
-# ? [e]xecute, [d]escribe, [a]bort:  (e)  
 ```
-
-We can still use pipes to pass input to aichat and generate shell commands:
-
-```sh
-aichat -e POST localhost with < data.json
-# curl -X POST -H "Content-Type: application/json" -d '{"a": 1, "b": 2}' localhost
-# ? [e]xecute, [d]escribe, [a]bort:  (e)  
-```
-
-We can also pipe the output of aichat which will disable interactive mode.
-```sh
-aichat -e find all json files in current folder | pbcopy
+$ aichat -e update my system
+? sudo apt update && sudo apt upgrade -y
 ```
 
 ### Shell integration
@@ -207,76 +199,49 @@ To install shell integration, go to [./scripts/shell-integration](https://github
 
 ### Generating code
 
-By using the `--code` or `-c` parameter, you can specifically request pure code output, for instance:
+By using the `--code` or `-c` parameter, you can specifically request pure code output.
 
-```
-aichat --code a echo server in node.js
-```
-
-```js
-const net = require('net');
-
-const server = net.createServer(socket => {
-  socket.on('data', data => {
-    socket.write(data);
-  });
-
-  socket.on('end', () => {
-    console.log('Client disconnected');
-  });
-});
-
-server.listen(3000, () => {
-  console.log('Server running on port 3000');
-});
-```
-
-Since it is valid js code, we can redirect the output to a file:
-```
-aichat --code a echo server in node.js > echo-server.js 
-node echo-server.js
-```
+![aichat-code](https://github.com/sigoden/aichat/assets/4012553/2bbf7c8a-3822-4222-9498-693dcd683cf4)
 
 **The `-c/--code` option ensures the extraction of code from Markdown.**
 
 ## Chat REPL
 
-Aichat has a powerful Chat REPL.
+AIChat has a powerful Chat REPL.
 
-The REPL supports:
+REPL Features:
 
-- Tab autocompletion
+- Tab auto-completion
 - [Custom REPL Prompt](https://github.com/sigoden/aichat/wiki/Custom-REPL-Prompt)
-- Emacs/Vi keybinding
+- Emacs/VI keybinding
 - Edit/paste multi-line text
-- Open an editor to modify the current prompt
-- History
-- Undo support
+- Open an editor to edit the current prompt
+- History and Undo
 
-### `.help` - print help message
+### `.help` - show help message
 
 ```
 > .help
-.help                    Print this help message
-.info                    Print system info
-.model                   Switch LLM model
-.role                    Use a role
-.info role               Show the role info
-.exit role               Leave current role
-.session                 Start a context-aware chat session
-.info session            Show the session info
-.save session            Save the session to the file
-.clear messages          Clear messages in the session
+.help                    Show this help message
+.info                    View system info
+.model                   Change the current LLM
+.prompt                  Create a temporary role using a prompt
+.role                    Switch to a specific role
+.info role               View role info
+.exit role               Leave the role
+.session                 Begin a chat session
+.info session            View session info
+.save session            Save the chat to file
+.clear messages          Erase messages in the current session
 .exit session            End the current session
-.file                    Attach files to the message and then submit it
-.set                     Modify the configuration parameters
-.copy                    Copy the last reply to the clipboard
+.file                    Include files with the message
+.set                     Adjust settings
+.copy                    Copy the last response
 .exit                    Exit the REPL
 
-Type ::: to begin multi-line editing, type ::: to end it.
-Press Ctrl+O to open an editor to modify the current prompt.
-Press Ctrl+C to abort readline, Ctrl+D to exit the REPL
-
+Type ::: to start multi-line editing, type ::: to finish it.
+Press Ctrl+O to open an editor to edit the input buffer.
+Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL
 ```
 
 ### `.info` - view information
@@ -284,34 +249,39 @@ Press Ctrl+C to abort readline, Ctrl+D to exit the REPL
 ```
 > .info
 model               openai:gpt-3.5-turbo
+max_output_tokens   4096 (current model)
 temperature         -
+top_p               -
 dry_run             false
 save                true
-save_session        true
+save_session        -
 highlight           true
 light_theme         false
 wrap                no
 wrap_code           false
-auto_copy           false
+auto_copy           true
 keybindings         emacs
 prelude             -
-compress_threshold  1000
+compress_threshold  2000
 config_file         /home/alice/.config/aichat/config.yaml
 roles_file          /home/alice/.config/aichat/roles.yaml
 messages_file       /home/alice/.config/aichat/messages.md
 sessions_dir        /home/alice/.config/aichat/sessions
 ```
 
-### `.model` - choose a model
+> 💡 Run `.info role` to view your current role information.
+> 💡 Run `.info session` to view your current session information.
+
+### `.model` - change the current LLM
 
 ```
 > .model openai:gpt-4
-> .model ollama:llama2
+> .model ollama:llama3
 ```
 
-> You can easily enter model name using autocomplete.
+> Tab autocompletion helps in quickly typing the model names.
 
-### `.role` - let the AI play a role
+### `.role` - switch to a specific role
 
 Select a role:
 
@@ -335,26 +305,15 @@ emoji> .exit role
 Hello there! How can I assist you today?
 ```
 
-Show role info:
-
+Temporarily use a role without switching to it:
 ```
-emoji> .info role
-name: emoji
-prompt: I want you to translate the sentences I write into emojis. I will write the sentence, and you will express it with emojis. I just want you to express it with emojis. I don't want you to reply with anything but emoji. When I need to tell you something in English, I will do it by wrapping it in curly brackets like {like this}.
-temperature: null
-```
+> .role emoji hello
+👋
 
-Temporarily use a role to send a message.
-```
-> ::: .role emoji
-hello world
-:::
-👋🌍
-
-> 
+>
 ```
 
-### `.session` - context-aware conversation
+### `.session` - Begin a chat session
 
 By default, aichat behaves in a one-off request/response manner.
 
@@ -375,11 +334,19 @@ temp) .exit session                                                             
 
 ```
 
-The prompt on the right side is about the current usage of tokens and the proportion of tokens used, 
-compared to the maximum number of tokens allowed by the model.
+### `.prompt` - create a temporary role using a prompt
 
+There are situations where setting a system message is necessary, but modifying the `roles.yaml` file is undesirable.
+To address this, we leverage the `.prompt` to create a temporary role specifically for this purpose.
 
-### `.file` - attach files to the message 
+```
+> .prompt your are a js console
+
+%%> Date.now()
+1658333431437
+```
+
+### `.file` - read files and send them as input
 
 ```
 Usage: .file <file>... [-- text...]
@@ -390,52 +357,91 @@ Usage: .file <file>... [-- text...]
 .file https://ibb.co/a.png https://ibb.co/b.png -- what is the difference?
 ```
 
-> Only the current model that supports vision can process images submitted through `.file` command.
+> The capability to process images through `.file` command depends on the current model’s vision support.
 
-### `.set` - modify the configuration temporarily
+### `.set` - adjust settings (non-persistent)
 
 ```
+.set max_output_tokens 4096
 .set temperature 1.2
+.set top_p 0.8
 .set compress_threshold 1000
 .set dry_run true
-.set highlight false
-.set save false
-.set save_session true
-.set auto_copy true
 ```
 
-### Roles
+## Server
 
-We can define a batch of roles in `roles.yaml`.
+AIChat comes with a built-in lightweight web server.
 
-> Retrieve the location of `roles.yaml` through the REPL `.info` command or CLI `--info` option.
+```
+$ aichat --serve
+Chat Completions API: http://127.0.0.1:8000/v1/chat/completions
+LLM Playground:       http://127.0.0.1:8000/playground
+LLM ARENA:            http://127.0.0.1:8000/arena
 
-For example, we can define a role:
+$ aichat --serve 0.0.0.0:8080  # to specify a different server address
+```
+
+### OpenAI format API
+
+AIChat offers the ability to function as a proxy server for all LLMs. This allows you to interact with different LLMs using the familiar OpenAI API format, simplifying the process of accessing and utilizing these LLMs.
+
+Test with curl:
+
+```sh
+curl -X POST -H "Content-Type: application/json" -d '{
+  "model":"claude:claude-3-opus-20240229",
+  "messages":[{"role":"user","content":"hello"}], 
+  "stream":true
+}' http://127.0.0.1:8000/v1/chat/completions
+```
+
+### LLM Playground
+
+The LLM Playground is a webapp that allows you to interact with any LLM supported by AIChat directly in your browser.
+
+![image](https://github.com/sigoden/aichat/assets/4012553/68043aa3-5778-4688-9c2f-3d96aa600b7a)
+
+### LLM Arena
+
+The LLM Arena is a web-based platform where you can compare different LLMs side-by-side. 
+
+![image](https://github.com/sigoden/aichat/assets/4012553/dc6dbf5a-488f-4bf4-a710-f1f9fc76933b)
+
+## Defining Roles
+
+The `roles.yaml` file allows you to define a variety of roles, each with its own unique prompt and behavior. This enables the LLM to adapt to specific tasks and provide tailored responses.
+
+We can define a role like this:
 
 ```yaml
-- name: shell
+- name: emoji
   prompt: >
-    I want you to act as a Linux shell expert.
-    I want you to answer only with bash code.
-    Do not provide explanations.
+    I want you to translate the sentences I write into emojis.
+    I will write the sentence, and you will express it with emojis.
+    I don't want you to reply with anything but emoji.
 ```
 
-Let LLM answer questions in the role of a Linux shell expert.
+This enables the LLM to respond as a Linux shell expert.
 
 ```
-> .role shell
+> .role emoji
 
-shell>  extract encrypted zipfile app.zip to /tmp/app
-mkdir /tmp/app
-unzip -P PASSWORD app.zip -d /tmp/app
+emoji> fire
+🔥
 ```
 
-For more details about roles, please visit [Role Guide](https://github.com/sigoden/aichat/wiki/Role-Guide).
+## Wikis
+
+- [Role Guide](https://github.com/sigoden/aichat/wiki/Role-Guide)
+- [Environment Variables](https://github.com/sigoden/aichat/wiki/Environment-Variables)
+- [Custom REPL Prompt](https://github.com/sigoden/aichat/wiki/Custom-REPL-Prompt)
+- [Custom Theme](https://github.com/sigoden/aichat/wiki/Custom-Theme)
 
 ## License
 
 Copyright (c) 2023-2024 aichat-developers.
 
-Aichat is made available under the terms of either the MIT License or the Apache License 2.0, at your option.
+AIChat is made available under the terms of either the MIT License or the Apache License 2.0, at your option.
 
 See the LICENSE-APACHE and LICENSE-MIT files for license details.

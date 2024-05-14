@@ -1,29 +1,30 @@
-use super::openai::openai_build_body;
-use super::{ExtraConfig, Model, ModelConfig, OpenAICompatibleClient, PromptType, SendData};
+use crate::client::OPENAI_COMPATIBLE_PLATFORMS;
 
-use crate::utils::PromptKind;
+use super::openai::openai_build_body;
+use super::{
+    ExtraConfig, Model, ModelConfig, OpenAICompatibleClient, PromptAction, PromptKind, SendData,
+};
 
 use anyhow::Result;
-use async_trait::async_trait;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
-    pub api_base: String,
+    pub api_base: Option<String>,
     pub api_key: Option<String>,
     pub chat_endpoint: Option<String>,
+    #[serde(default)]
     pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
 }
 
-openai_compatible_client!(OpenAICompatibleClient);
-
 impl OpenAICompatibleClient {
+    config_get_fn!(api_base, get_api_base);
     config_get_fn!(api_key, get_api_key);
 
-    pub const PROMPTS: [PromptType<'static>; 5] = [
+    pub const PROMPTS: [PromptAction<'static>; 5] = [
         ("name", "Platform Name:", true, PromptKind::String),
         ("api_base", "API Base:", true, PromptKind::String),
         ("api_key", "API Key:", false, PromptKind::String),
@@ -36,25 +37,27 @@ impl OpenAICompatibleClient {
         ),
     ];
 
-    pub fn list_models(local_config: &OpenAICompatibleConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-
-        local_config
-            .models
-            .iter()
-            .map(|v| {
-                Model::new(client_name, &v.name)
-                    .set_capabilities(v.capabilities)
-                    .set_max_input_tokens(v.max_input_tokens)
-                    .set_extra_fields(v.extra_fields.clone())
-            })
-            .collect()
-    }
-
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+        let api_base = match self.get_api_base() {
+            Ok(v) => v,
+            Err(err) => {
+                match OPENAI_COMPATIBLE_PLATFORMS
+                    .into_iter()
+                    .find_map(|(name, api_base)| {
+                        if name == self.model.client_name {
+                            Some(api_base.to_string())
+                        } else {
+                            None
+                        }
+                    }) {
+                    Some(v) => v,
+                    None => return Err(err),
+                }
+            }
+        };
         let api_key = self.get_api_key().ok();
 
-        let mut body = openai_build_body(data, self.model.name.clone());
+        let mut body = openai_build_body(data, &self.model);
         self.model.merge_extra_fields(&mut body);
 
         let chat_endpoint = self
@@ -63,7 +66,7 @@ impl OpenAICompatibleClient {
             .as_deref()
             .unwrap_or("/chat/completions");
 
-        let url = format!("{}{chat_endpoint}", self.config.api_base);
+        let url = format!("{api_base}{chat_endpoint}");
 
         debug!("OpenAICompatible Request: {url} {body}");
 
@@ -75,3 +78,9 @@ impl OpenAICompatibleClient {
         Ok(builder)
     }
 }
+
+impl_client_trait!(
+    OpenAICompatibleClient,
+    crate::client::openai::openai_send_message,
+    crate::client::openai::openai_send_message_streaming
+);

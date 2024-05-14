@@ -1,12 +1,9 @@
 use super::{
-    message::*, patch_system_message, Client, ExtraConfig, Model, ModelConfig, OllamaClient,
-    PromptType, SendData,
+    catch_error, message::*, CompletionDetails, ExtraConfig, Model, ModelConfig, OllamaClient,
+    PromptAction, PromptKind, SendData, SseHandler,
 };
 
-use crate::{render::ReplyHandler, utils::PromptKind};
-
 use anyhow::{anyhow, bail, Result};
-use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
@@ -15,39 +12,20 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OllamaConfig {
     pub name: Option<String>,
-    pub api_base: String,
-    pub api_key: Option<String>,
+    pub api_base: Option<String>,
+    pub api_auth: Option<String>,
     pub chat_endpoint: Option<String>,
     pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
 }
 
-#[async_trait]
-impl Client for OllamaClient {
-    client_common_fns!();
-
-    async fn send_message_inner(&self, client: &ReqwestClient, data: SendData) -> Result<String> {
-        let builder = self.request_builder(client, data)?;
-        send_message(builder).await
-    }
-
-    async fn send_message_streaming_inner(
-        &self,
-        client: &ReqwestClient,
-        handler: &mut ReplyHandler,
-        data: SendData,
-    ) -> Result<()> {
-        let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler).await
-    }
-}
-
 impl OllamaClient {
-    config_get_fn!(api_key, get_api_key);
+    config_get_fn!(api_base, get_api_base);
+    config_get_fn!(api_auth, get_api_auth);
 
-    pub const PROMPTS: [PromptType<'static>; 4] = [
+    pub const PROMPTS: [PromptAction<'static>; 4] = [
         ("api_base", "API Base:", true, PromptKind::String),
-        ("api_key", "API Key:", false, PromptKind::String),
+        ("api_auth", "API Auth:", false, PromptKind::String),
         ("models[].name", "Model Name:", true, PromptKind::String),
         (
             "models[].max_input_tokens",
@@ -57,68 +35,55 @@ impl OllamaClient {
         ),
     ];
 
-    pub fn list_models(local_config: &OllamaConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-
-        local_config
-            .models
-            .iter()
-            .map(|v| {
-                Model::new(client_name, &v.name)
-                    .set_capabilities(v.capabilities)
-                    .set_max_input_tokens(v.max_input_tokens)
-                    .set_extra_fields(v.extra_fields.clone())
-            })
-            .collect()
-    }
-
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
-        let api_key = self.get_api_key().ok();
+        let api_base = self.get_api_base()?;
+        let api_auth = self.get_api_auth().ok();
 
-        let mut body = build_body(data, self.model.name.clone())?;
+        let mut body = build_body(data, &self.model)?;
         self.model.merge_extra_fields(&mut body);
 
         let chat_endpoint = self.config.chat_endpoint.as_deref().unwrap_or("/api/chat");
 
-        let url = format!("{}{chat_endpoint}", self.config.api_base);
+        let url = format!("{api_base}{chat_endpoint}");
 
         debug!("Ollama Request: {url} {body}");
 
         let mut builder = client.post(url).json(&body);
-        if let Some(api_key) = api_key {
-            builder = builder.header("Authorization", api_key)
+        if let Some(api_auth) = api_auth {
+            builder = builder.header("Authorization", api_auth)
         }
 
         Ok(builder)
     }
 }
 
-async fn send_message(builder: RequestBuilder) -> Result<String> {
+impl_client_trait!(OllamaClient, send_message, send_message_streaming);
+
+async fn send_message(builder: RequestBuilder) -> Result<(String, CompletionDetails)> {
     let res = builder.send().await?;
     let status = res.status();
-    if status != 200 {
-        let text = res.text().await?;
-        bail!("{status}, {text}");
+    let data = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
     }
-    let data: Value = res.json().await?;
-    let output = data["message"]["content"]
+    let text = data["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    Ok(output.to_string())
+    Ok((text.to_string(), CompletionDetails::default()))
 }
 
-async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHandler) -> Result<()> {
+async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandler) -> Result<()> {
     let res = builder.send().await?;
     let status = res.status();
-    if status != 200 {
-        let text = res.text().await?;
-        bail!("{status}, {text}");
+    if !status.is_success() {
+        let data = res.json().await?;
+        catch_error(&data, status.as_u16())?;
     } else {
         let mut stream = res.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if chunk.is_empty() {
-              continue;
+                continue;
             }
             let data: Value = serde_json::from_slice(&chunk)?;
             if data["done"].is_boolean() {
@@ -133,14 +98,13 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHand
     Ok(())
 }
 
-fn build_body(data: SendData, model: String) -> Result<Value> {
+fn build_body(data: SendData, model: &Model) -> Result<Value> {
     let SendData {
-        mut messages,
+        messages,
         temperature,
+        top_p,
         stream,
     } = data;
-
-    patch_system_message(&mut messages);
 
     let mut network_image_urls = vec![];
     let messages: Vec<Value> = messages
@@ -189,15 +153,20 @@ fn build_body(data: SendData, model: String) -> Result<Value> {
     }
 
     let mut body = json!({
-        "model": model,
+        "model": &model.name,
         "messages": messages,
         "stream": stream,
+        "options": {},
     });
 
-    if let Some(temperature) = temperature {
-        body["options"] = json!({
-            "temperature": temperature,
-        });
+    if let Some(v) = model.max_tokens_param() {
+        body["options"]["num_predict"] = v.into();
+    }
+    if let Some(v) = temperature {
+        body["options"]["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["options"]["top_p"] = v.into();
     }
 
     Ok(body)

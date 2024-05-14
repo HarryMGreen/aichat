@@ -6,14 +6,15 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::{ensure_model_capabilities, init_client};
+use crate::client::{ensure_model_capabilities, init_client, send_stream};
 use crate::config::{GlobalConfig, Input, InputContext, State};
-use crate::render::{render_error, render_stream};
+use crate::render::render_error;
 use crate::utils::{create_abort_signal, set_text, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
+use nu_ansi_term::Color;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
@@ -22,34 +23,40 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::{env, process};
 
+lazy_static! {
+    static ref SPLIT_FILES_TEXT_ARGS_RE: Regex =
+        Regex::new(r"(?m) (-- |--\n|--\r\n|--\r|--$)").unwrap();
+}
+
 const MENU_NAME: &str = "completion_menu";
 
 lazy_static! {
-    static ref REPL_COMMANDS: [ReplCommand; 15] = [
-        ReplCommand::new(".help", "Print this help message", State::all()),
-        ReplCommand::new(".info", "Print system info", State::all()),
-        ReplCommand::new(".model", "Switch LLM model", State::all()),
-        ReplCommand::new(".role", "Use a role", State::able_change_role()),
-        ReplCommand::new(".info role", "Show the role info", State::in_role(),),
-        ReplCommand::new(".exit role", "Leave current role", State::in_role(),),
+    static ref REPL_COMMANDS: [ReplCommand; 16] = [
+        ReplCommand::new(".help", "Show this help message", State::all()),
+        ReplCommand::new(".info", "View system info", State::all()),
+        ReplCommand::new(".model", "Change the current LLM", State::all()),
         ReplCommand::new(
-            ".session",
-            "Start a context-aware chat session",
-            State::not_in_session(),
+            ".prompt",
+            "Create a temporary role using a prompt",
+            State::able_change_role()
         ),
         ReplCommand::new(
-            ".info session",
-            "Show the session info",
-            State::in_session(),
+            ".role",
+            "Switch to a specific role",
+            State::able_change_role()
         ),
+        ReplCommand::new(".info role", "View role info", State::in_role(),),
+        ReplCommand::new(".exit role", "Leave the role", State::in_role(),),
+        ReplCommand::new(".session", "Begin a chat session", State::not_in_session(),),
+        ReplCommand::new(".info session", "View session info", State::in_session(),),
         ReplCommand::new(
             ".save session",
-            "Save the session to the file",
+            "Save the chat to file",
             State::in_session(),
         ),
         ReplCommand::new(
             ".clear messages",
-            "Clear messages in the session",
+            "Erase messages in the current session",
             State::unable_change_role()
         ),
         ReplCommand::new(
@@ -57,17 +64,9 @@ lazy_static! {
             "End the current session",
             State::in_session(),
         ),
-        ReplCommand::new(
-            ".file",
-            "Attach files to the message and then submit it",
-            State::all()
-        ),
-        ReplCommand::new(".set", "Modify the configuration parameters", State::all()),
-        ReplCommand::new(
-            ".copy",
-            "Copy the last reply to the clipboard",
-            State::all()
-        ),
+        ReplCommand::new(".file", "Include files with the message", State::all()),
+        ReplCommand::new(".set", "Adjust settings", State::all()),
+        ReplCommand::new(".copy", "Copy the last response", State::all()),
         ReplCommand::new(".exit", "Exit the REPL", State::all()),
     ];
     static ref COMMAND_RE: Regex = Regex::new(r"^\s*(\.\S*)\s*").unwrap();
@@ -83,8 +82,6 @@ pub struct Repl {
 
 impl Repl {
     pub fn init(config: &GlobalConfig) -> Result<Self> {
-        config.write().in_repl = true;
-
         let editor = Self::create_editor(config)?;
 
         let prompt = ReplPrompt::new(config);
@@ -99,25 +96,18 @@ impl Repl {
         })
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         self.banner();
-
-        let mut already_ctrlc = false;
-        let ctrlc_exit = self.config.read().ctrlc_exit;
 
         loop {
             if self.abort.aborted_ctrld() {
                 break;
             }
-            if self.abort.aborted_ctrlc() && !already_ctrlc {
-                already_ctrlc = true;
-            }
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {
-                    already_ctrlc = false;
                     self.abort.reset();
-                    match self.handle(&line) {
+                    match self.handle(&line).await {
                         Ok(exit) => {
                             if exit {
                                 break;
@@ -131,15 +121,7 @@ impl Repl {
                 }
                 Ok(Signal::CtrlC) => {
                     self.abort.set_ctrlc();
-                    if ctrlc_exit {
-                        if already_ctrlc {
-                            break;
-                        }
-                        already_ctrlc = true;
-                        println!("(To exit, press Ctrl+C again or Ctrl+D or type .exit)\n");
-                    } else {
-                        println!("(To exit, press Ctrl+D or type .exit)\n");
-                    }
+                    println!("(To exit, press Ctrl+D or enter \".exit\")\n");
                 }
                 Ok(Signal::CtrlD) => {
                     self.abort.set_ctrld();
@@ -148,11 +130,11 @@ impl Repl {
                 _ => {}
             }
         }
-        self.handle(".exit session")?;
+        self.handle(".exit session").await?;
         Ok(())
     }
 
-    fn handle(&self, mut line: &str) -> Result<bool> {
+    async fn handle(&self, mut line: &str) -> Result<bool> {
         if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
             if let Some(text_match) = captures.get(1) {
                 line = text_match.as_str();
@@ -184,19 +166,24 @@ impl Repl {
                     }
                     None => println!("Usage: .model <name>"),
                 },
+                ".prompt" => match args {
+                    Some(text) => {
+                        self.config.write().set_prompt(text)?;
+                    }
+                    None => println!("Usage: .prompt <text>..."),
+                },
                 ".role" => match args {
                     Some(args) => match args.split_once(|c| c == '\n' || c == ' ') {
                         Some((name, text)) => {
                             let role = self.config.read().retrieve_role(name.trim())?;
-                            let input =
-                                Input::from_str(text.trim(), InputContext::new(Some(role), false));
-                            self.ask(input)?;
+                            let input = Input::from_str(text.trim(), InputContext::role(role));
+                            self.ask(input).await?;
                         }
                         None => {
                             self.config.write().set_role(args)?;
                         }
                     },
-                    None => println!(r#"Usage: .role <name> [text...]"#),
+                    None => println!(r#"Usage: .role <name> [text]..."#),
                 },
                 ".session" => {
                     self.config.write().start_session(args)?;
@@ -214,11 +201,14 @@ impl Repl {
                         }
                     }
                 }
-                ".set" => {
-                    if let Some(args) = args {
+                ".set" => match args {
+                    Some(args) => {
                         self.config.write().update(args)?;
                     }
-                }
+                    _ => {
+                        println!("Usage: .set <key> <value>...")
+                    }
+                },
                 ".copy" => {
                     let config = self.config.read();
                     self.copy(config.last_reply())
@@ -226,13 +216,10 @@ impl Repl {
                 }
                 ".file" => match args {
                     Some(args) => {
-                        let (files, text) = match args.split_once(" -- ") {
-                            Some((files, text)) => (files.trim(), text.trim()),
-                            None => (args, ""),
-                        };
+                        let (files, text) = split_files_text(args);
                         let files = shell_words::split(files).with_context(|| "Invalid args")?;
                         let input = Input::new(text, files, self.config.read().input_context())?;
-                        self.ask(input)?;
+                        self.ask(input).await?;
                     }
                     None => println!("Usage: .file <files>... [-- <text>...]"),
                 },
@@ -258,7 +245,7 @@ impl Repl {
             },
             None => {
                 let input = Input::from_str(line, self.config.read().input_context());
-                self.ask(input)?;
+                self.ask(input).await?;
             }
         }
 
@@ -267,7 +254,7 @@ impl Repl {
         Ok(false)
     }
 
-    fn ask(&self, input: Input) -> Result<()> {
+    async fn ask(&self, input: Input) -> Result<()> {
         if input.is_empty() {
             return Ok(());
         }
@@ -277,15 +264,27 @@ impl Repl {
         self.config.read().maybe_print_send_tokens(&input);
         let mut client = init_client(&self.config)?;
         ensure_model_capabilities(client.as_mut(), input.required_capabilities())?;
-        let output = render_stream(&input, client.as_ref(), &self.config, self.abort.clone())?;
+        let output = send_stream(&input, client.as_ref(), &self.config, self.abort.clone()).await?;
         self.config.write().save_message(input, &output)?;
         self.config.read().maybe_copy(&output);
         if self.config.write().should_compress_session() {
             let config = self.config.clone();
-            std::thread::spawn(move || -> anyhow::Result<()> {
-                let _ = compress_session(&config);
+            let color = if config.read().light_theme {
+                Color::LightGray
+            } else {
+                Color::DarkGray
+            };
+            print!(
+                "\n📢 {}{}{}\n",
+                color.normal().paint(
+                    "Session compression is being activated because the current tokens exceed `"
+                ),
+                color.italic().paint("compress_threshold"),
+                color.normal().paint("`."),
+            );
+            tokio::spawn(async move {
+                let _ = compress_session(&config).await;
                 config.write().end_compressing_session();
-                Ok(())
             });
         }
         Ok(())
@@ -295,7 +294,7 @@ impl Repl {
         let version = env!("CARGO_PKG_VERSION");
         print!(
             r#"Welcome to aichat {version}
-Type ".help" for more information.
+Type ".help" for additional help.
 "#
         )
     }
@@ -316,7 +315,7 @@ Type ".help" for more information.
             .with_validator(Box::new(ReplValidator))
             .with_ansi_colors(true);
 
-        if let Ok(cmd) = env::var("VISUAL").or_else(|_| env::var("EDITOR")) {
+        if let Some(cmd) = config.read().buffer_editor() {
             let temp_file =
                 env::temp_dir().join(format!("aichat-{}.txt", chrono::Utc::now().timestamp()));
             let command = process::Command::new(cmd);
@@ -412,7 +411,7 @@ impl Validator for ReplValidator {
 }
 
 fn unknown_command() -> Result<()> {
-    bail!(r#"Unknown command. Type ".help" for more information."#);
+    bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
 fn dump_repl_help() {
@@ -424,9 +423,9 @@ fn dump_repl_help() {
     println!(
         r###"{head}
 
-Type ::: to begin multi-line editing, type ::: to end it.
-Press Ctrl+O to open an editor to modify the current prompt.
-Press Ctrl+C to abort aichat, Ctrl+D to exit the REPL"###,
+Type ::: to start multi-line editing, type ::: to finish it.
+Press Ctrl+O to open an editor for editing the input buffer.
+Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
     );
 }
 
@@ -442,16 +441,31 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-fn compress_session(config: &GlobalConfig) -> Result<()> {
+async fn compress_session(config: &GlobalConfig) -> Result<()> {
     let input = Input::from_str(
-        &config.read().summarize_prompt,
+        config.read().summarize_prompt(),
         config.read().input_context(),
     );
     let mut client = init_client(config)?;
     ensure_model_capabilities(client.as_mut(), input.required_capabilities())?;
-    let summary = client.send_message(input)?;
+    let (summary, _) = client.send_message(input).await?;
     config.write().compress_session(&summary);
     Ok(())
+}
+
+fn split_files_text(args: &str) -> (&str, &str) {
+    match SPLIT_FILES_TEXT_ARGS_RE.find(args).ok().flatten() {
+        Some(mat) => {
+            let files = &args[0..mat.start()];
+            let text = if mat.end() < args.len() {
+                &args[mat.end()..]
+            } else {
+                ""
+            };
+            (files, text)
+        }
+        None => (args, ""),
+    }
 }
 
 #[cfg(test)]
@@ -474,6 +488,25 @@ mod tests {
         assert_eq!(
             parse_command(".prompt \nabc\n"),
             Some((".prompt", Some("abc")))
+        );
+    }
+
+    #[test]
+    fn test_split_files_text() {
+        assert_eq!(split_files_text("file.txt"), ("file.txt", ""));
+        assert_eq!(split_files_text("file.txt --"), ("file.txt", ""));
+        assert_eq!(split_files_text("file.txt -- hello"), ("file.txt", "hello"));
+        assert_eq!(
+            split_files_text("file.txt --\nhello"),
+            ("file.txt", "hello")
+        );
+        assert_eq!(
+            split_files_text("file.txt --\r\nhello"),
+            ("file.txt", "hello")
+        );
+        assert_eq!(
+            split_files_text("file.txt --\rhello"),
+            ("file.txt", "hello")
         );
     }
 }

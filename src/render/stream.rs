@@ -1,9 +1,8 @@
-use super::{MarkdownRender, ReplyEvent};
+use super::{MarkdownRender, SseEvent};
 
-use crate::utils::AbortSignal;
+use crate::utils::{run_spinner, AbortSignal};
 
 use anyhow::Result;
-use crossbeam::channel::Receiver;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
@@ -11,38 +10,39 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode},
 };
 use std::{
-    io::{self, Stdout, Write},
-    ops::Div,
-    time::{Duration, Instant},
+    io::{self, stdout, Stdout, Write},
+    time::Duration,
 };
 use textwrap::core::display_width;
+use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 
-pub fn markdown_stream(
-    rx: &Receiver<ReplyEvent>,
+pub async fn markdown_stream(
+    rx: UnboundedReceiver<SseEvent>,
     render: &mut MarkdownRender,
     abort: &AbortSignal,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    let ret = markdown_stream_inner(rx, render, abort, &mut stdout);
+    let ret = markdown_stream_inner(rx, render, abort, &mut stdout).await;
 
     disable_raw_mode()?;
 
     ret
 }
 
-pub fn raw_stream(rx: &Receiver<ReplyEvent>, abort: &AbortSignal) -> Result<()> {
+pub async fn raw_stream(mut rx: UnboundedReceiver<SseEvent>, abort: &AbortSignal) -> Result<()> {
     loop {
         if abort.aborted() {
             return Ok(());
         }
-        if let Ok(evt) = rx.try_recv() {
+        if let Some(evt) = rx.recv().await {
             match evt {
-                ReplyEvent::Text(text) => {
+                SseEvent::Text(text) => {
                     print!("{}", text);
+                    stdout().flush()?;
                 }
-                ReplyEvent::Done => {
+                SseEvent::Done => {
                     break;
                 }
             }
@@ -51,33 +51,32 @@ pub fn raw_stream(rx: &Receiver<ReplyEvent>, abort: &AbortSignal) -> Result<()> 
     Ok(())
 }
 
-fn markdown_stream_inner(
-    rx: &Receiver<ReplyEvent>,
+async fn markdown_stream_inner(
+    mut rx: UnboundedReceiver<SseEvent>,
     render: &mut MarkdownRender,
     abort: &AbortSignal,
     writer: &mut Stdout,
 ) -> Result<()> {
-    let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(50);
-
     let mut buffer = String::new();
     let mut buffer_rows = 1;
 
     let columns = terminal::size()?.0;
 
-    let mut spinner = Spinner::new(" Generating");
+    let (spinner_tx, spinner_rx) = oneshot::channel();
+    let mut spinner_tx = Some(spinner_tx);
+    tokio::spawn(run_spinner(" Generating", spinner_rx));
 
     'outer: loop {
         if abort.aborted() {
             return Ok(());
         }
-        spinner.step(writer)?;
-
-        for reply_event in gather_events(rx) {
-            spinner.stop(writer)?;
+        for reply_event in gather_events(&mut rx).await {
+            if let Some(spinner_tx) = spinner_tx.take() {
+                let _ = spinner_tx.send(());
+            }
 
             match reply_event {
-                ReplyEvent::Text(mut text) => {
+                SseEvent::Text(mut text) => {
                     // tab width hacking
                     text = text.replace('\t', "    ");
 
@@ -128,16 +127,13 @@ fn markdown_stream_inner(
 
                     writer.flush()?;
                 }
-                ReplyEvent::Done => {
+                SseEvent::Done => {
                     break 'outer;
                 }
             }
         }
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| tick_rate.div(2));
-        if crossterm::event::poll(timeout)? {
+        if crossterm::event::poll(Duration::from_millis(25))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
@@ -152,83 +148,37 @@ fn markdown_stream_inner(
                 }
             }
         }
-
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
-        }
     }
 
-    spinner.stop(writer)?;
-
+    if let Some(spinner_tx) = spinner_tx.take() {
+        let _ = spinner_tx.send(());
+    }
     Ok(())
 }
 
-struct Spinner {
-    index: usize,
-    message: String,
-    stopped: bool,
-}
-
-impl Spinner {
-    const DATA: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-    fn new(message: &str) -> Self {
-        Spinner {
-            index: 0,
-            message: message.to_string(),
-            stopped: false,
-        }
-    }
-
-    fn step(&mut self, writer: &mut Stdout) -> Result<()> {
-        if self.stopped {
-            return Ok(());
-        }
-        let frame = Self::DATA[self.index % Self::DATA.len()];
-        let dots = ".".repeat((self.index / 5) % 4);
-        let line = format!("{frame}{}{:<3}", self.message, dots);
-        queue!(writer, cursor::MoveToColumn(0), style::Print(line),)?;
-        if self.index == 0 {
-            queue!(writer, cursor::Hide)?;
-        }
-        writer.flush()?;
-        self.index += 1;
-        Ok(())
-    }
-
-    fn stop(&mut self, writer: &mut Stdout) -> Result<()> {
-        if self.stopped {
-            return Ok(());
-        }
-        self.stopped = true;
-        queue!(
-            writer,
-            cursor::MoveToColumn(0),
-            terminal::Clear(terminal::ClearType::FromCursorDown),
-            cursor::Show
-        )?;
-        writer.flush()?;
-        Ok(())
-    }
-}
-
-fn gather_events(rx: &Receiver<ReplyEvent>) -> Vec<ReplyEvent> {
+async fn gather_events(rx: &mut UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
     let mut texts = vec![];
     let mut done = false;
-    for reply_event in rx.try_iter() {
-        match reply_event {
-            ReplyEvent::Text(v) => texts.push(v),
-            ReplyEvent::Done => {
-                done = true;
+    tokio::select! {
+        _ = async {
+            while let Some(reply_event) = rx.recv().await {
+                match reply_event {
+                    SseEvent::Text(v) => texts.push(v),
+                    SseEvent::Done => {
+                        done = true;
+                        break;
+                    }
+                }
             }
-        }
-    }
+        } => {}
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    };
     let mut events = vec![];
     if !texts.is_empty() {
-        events.push(ReplyEvent::Text(texts.join("")))
+        events.push(SseEvent::Text(texts.join("")))
     }
     if done {
-        events.push(ReplyEvent::Done)
+        events.push(SseEvent::Done)
     }
     events
 }

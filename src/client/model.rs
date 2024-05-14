@@ -1,9 +1,9 @@
 use super::message::{Message, MessageContent};
 
-use crate::utils::count_tokens;
+use crate::utils::{count_tokens, format_option_value};
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
 const PER_MESSAGES_TOKENS: usize = 5;
 const BASIS_TOKENS: usize = 2;
@@ -13,8 +13,12 @@ pub struct Model {
     pub client_name: String,
     pub name: String,
     pub max_input_tokens: Option<usize>,
-    pub extra_fields: Option<serde_json::Map<String, serde_json::Value>>,
+    pub max_output_tokens: Option<isize>,
+    pub pass_max_tokens: bool,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
     pub capabilities: ModelCapabilities,
+    pub extra_fields: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for Model {
@@ -28,13 +32,34 @@ impl Model {
         Self {
             client_name: client_name.into(),
             name: name.into(),
-            extra_fields: None,
             max_input_tokens: None,
+            max_output_tokens: None,
+            pass_max_tokens: false,
+            input_price: None,
+            output_price: None,
             capabilities: ModelCapabilities::Text,
+            extra_fields: None,
         }
     }
 
-    pub fn find(models: &[Self], value: &str) -> Option<Self> {
+    pub fn from_config(client_name: &str, models: &[ModelConfig]) -> Vec<Self> {
+        models
+            .iter()
+            .map(|v| {
+                let mut model = Model::new(client_name, &v.name);
+                model
+                    .set_max_input_tokens(v.max_input_tokens)
+                    .set_max_tokens(v.max_output_tokens, v.pass_max_tokens)
+                    .set_input_price(v.input_price)
+                    .set_output_price(v.output_price)
+                    .set_supports_vision(v.supports_vision)
+                    .set_extra_fields(&v.extra_fields);
+                model
+            })
+            .collect()
+    }
+
+    pub fn find(models: &[&Self], value: &str) -> Option<Self> {
         let mut model = None;
         let (client_name, model_name) = match value.split_once(':') {
             Some((client_name, model_name)) => {
@@ -49,16 +74,16 @@ impl Model {
         match model_name {
             Some(model_name) => {
                 if let Some(found) = models.iter().find(|v| v.id() == value) {
-                    model = Some(found.clone());
+                    model = Some((*found).clone());
                 } else if let Some(found) = models.iter().find(|v| v.client_name == client_name) {
-                    let mut found = found.clone();
+                    let mut found = (*found).clone();
                     found.name = model_name.to_string();
                     model = Some(found)
                 }
             }
             None => {
                 if let Some(found) = models.iter().find(|v| v.client_name == client_name) {
-                    model = Some(found.clone());
+                    model = Some((*found).clone());
                 }
             }
         }
@@ -69,24 +94,85 @@ impl Model {
         format!("{}:{}", self.client_name, self.name)
     }
 
-    pub fn set_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
-        self.capabilities = capabilities;
-        self
+    pub fn description(&self) -> String {
+        let max_input_tokens = format_option_value(&self.max_input_tokens);
+        let max_output_tokens = format_option_value(&self.max_output_tokens);
+        let input_price = format_option_value(&self.input_price);
+        let output_price = format_option_value(&self.output_price);
+        let vision = if self.capabilities.contains(ModelCapabilities::Vision) {
+            "👁"
+        } else {
+            ""
+        };
+        format!(
+            "{:>8} / {:>8}  |  {:>6} / {:>6}  {}",
+            max_input_tokens, max_output_tokens, input_price, output_price, vision
+        )
     }
 
-    pub fn set_extra_fields(
-        mut self,
-        extra_fields: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> Self {
-        self.extra_fields = extra_fields;
-        self
+    pub fn supports_vision(&self) -> bool {
+        self.capabilities.contains(ModelCapabilities::Vision)
     }
 
-    pub fn set_max_input_tokens(mut self, max_input_tokens: Option<usize>) -> Self {
+    pub fn max_tokens_param(&self) -> Option<isize> {
+        if self.pass_max_tokens {
+            self.max_output_tokens
+        } else {
+            None
+        }
+    }
+
+    pub fn set_max_input_tokens(&mut self, max_input_tokens: Option<usize>) -> &mut Self {
         match max_input_tokens {
             None | Some(0) => self.max_input_tokens = None,
             _ => self.max_input_tokens = max_input_tokens,
         }
+        self
+    }
+
+    pub fn set_max_tokens(
+        &mut self,
+        max_output_tokens: Option<isize>,
+        pass_max_tokens: bool,
+    ) -> &mut Self {
+        match max_output_tokens {
+            None | Some(0) => self.max_output_tokens = None,
+            _ => self.max_output_tokens = max_output_tokens,
+        }
+        self.pass_max_tokens = pass_max_tokens;
+        self
+    }
+
+    pub fn set_input_price(&mut self, input_price: Option<f64>) -> &mut Self {
+        match input_price {
+            None => self.input_price = None,
+            _ => self.input_price = input_price,
+        }
+        self
+    }
+
+    pub fn set_output_price(&mut self, output_price: Option<f64>) -> &mut Self {
+        match output_price {
+            None => self.output_price = None,
+            _ => self.output_price = output_price,
+        }
+        self
+    }
+
+    pub fn set_supports_vision(&mut self, supports_vision: bool) -> &mut Self {
+        if supports_vision {
+            self.capabilities |= ModelCapabilities::Vision;
+        } else {
+            self.capabilities &= !ModelCapabilities::Vision;
+        }
+        self
+    }
+
+    pub fn set_extra_fields(
+        &mut self,
+        extra_fields: &Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> &mut Self {
+        self.extra_fields.clone_from(extra_fields);
         self
     }
 
@@ -127,9 +213,19 @@ impl Model {
 
     pub fn merge_extra_fields(&self, body: &mut serde_json::Value) {
         if let (Some(body), Some(extra_fields)) = (body.as_object_mut(), &self.extra_fields) {
-            for (k, v) in extra_fields {
-                if !body.contains_key(k) {
-                    body.insert(k.clone(), v.clone());
+            for (key, extra_field) in extra_fields {
+                if body.contains_key(key) {
+                    if let (Some(sub_body), Some(extra_field)) =
+                        (body[key].as_object_mut(), extra_field.as_object())
+                    {
+                        for (subkey, sub_field) in extra_field {
+                            if !sub_body.contains_key(subkey) {
+                                sub_body.insert(subkey.clone(), sub_field.clone());
+                            }
+                        }
+                    }
+                } else {
+                    body.insert(key.clone(), extra_field.clone());
                 }
             }
         }
@@ -140,10 +236,20 @@ impl Model {
 pub struct ModelConfig {
     pub name: String,
     pub max_input_tokens: Option<usize>,
+    pub max_output_tokens: Option<isize>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub pass_max_tokens: bool,
     pub extra_fields: Option<serde_json::Map<String, serde_json::Value>>,
-    #[serde(deserialize_with = "deserialize_capabilities")]
-    #[serde(default = "default_capabilities")]
-    pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuiltinModels {
+    pub platform: String,
+    pub models: Vec<ModelConfig>,
 }
 
 bitflags::bitflags! {
@@ -152,30 +258,4 @@ bitflags::bitflags! {
         const Text = 0b00000001;
         const Vision = 0b00000010;
     }
-}
-
-impl From<&str> for ModelCapabilities {
-    fn from(value: &str) -> Self {
-        let value = if value.is_empty() { "text" } else { value };
-        let mut output = ModelCapabilities::empty();
-        if value.contains("text") {
-            output |= ModelCapabilities::Text;
-        }
-        if value.contains("vision") {
-            output |= ModelCapabilities::Vision;
-        }
-        output
-    }
-}
-
-fn deserialize_capabilities<'de, D>(deserializer: D) -> Result<ModelCapabilities, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value: String = Deserialize::deserialize(deserializer)?;
-    Ok(value.as_str().into())
-}
-
-fn default_capabilities() -> ModelCapabilities {
-    ModelCapabilities::Text
 }

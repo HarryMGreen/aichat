@@ -140,11 +140,11 @@ impl MarkdownRender {
 
     fn highlight_line(&self, line: &str, syntax: &SyntaxReference, is_code: bool) -> String {
         let ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        let trimed_line: &str = &line[ws.len()..];
+        let trimmed_line: &str = &line[ws.len()..];
         let mut line_highlighted = None;
         if let Some(theme) = &self.options.theme {
             let mut highlighter = HighlightLines::new(syntax, theme);
-            if let Ok(ranges) = highlighter.highlight_line(trimed_line, &self.syntax_set) {
+            if let Ok(ranges) = highlighter.highlight_line(trimmed_line, &self.syntax_set) {
                 line_highlighted = Some(format!(
                     "{ws}{}",
                     as_terminal_escaped(&ranges, self.options.truecolor)
@@ -280,13 +280,14 @@ fn blend_fg_color(fg: SyntectColor, bg: SyntectColor) -> SyntectColor {
 }
 
 fn detect_code_block(line: &str) -> Option<String> {
+    let line = line.trim_start();
     if !line.starts_with("```") {
         return None;
     }
     let lang = line
         .chars()
         .skip(3)
-        .take_while(|v| v.is_alphanumeric())
+        .take_while(|v| !v.is_whitespace())
         .collect();
     Some(lang)
 }
@@ -379,5 +380,14 @@ std::error::Error>> {
         render.wrap_width = Some(80);
         let output = render.render(TEXT);
         assert_eq!(TEXT_WRAP_ALL, output);
+    }
+
+    #[test]
+    fn test_detect_code_block() {
+        assert_eq!(detect_code_block("```rust"), Some("rust".into()));
+        assert_eq!(detect_code_block("```c++"), Some("c++".into()));
+        assert_eq!(detect_code_block("  ```rust"), Some("rust".into()));
+        assert_eq!(detect_code_block("```"), Some("".into()));
+        assert_eq!(detect_code_block("``rust"), None);
     }
 }

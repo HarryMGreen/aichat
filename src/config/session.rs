@@ -18,6 +18,7 @@ pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
     model_id: String,
     temperature: Option<f64>,
+    top_p: Option<f64>,
     #[serde(default)]
     save_session: Option<bool>,
     messages: Vec<Message>,
@@ -43,6 +44,7 @@ impl Session {
         Self {
             model_id: config.model.id(),
             temperature: config.temperature,
+            top_p: config.top_p,
             save_session: config.save_session,
             messages: vec![],
             compressed_messages: vec![],
@@ -80,6 +82,10 @@ impl Session {
         self.temperature
     }
 
+    pub fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+
     pub fn save_session(&self) -> Option<bool> {
         self.save_session
     }
@@ -111,12 +117,15 @@ impl Session {
         if let Some(temperature) = self.temperature() {
             data["temperature"] = temperature.into();
         }
+        if let Some(top_p) = self.top_p() {
+            data["top_p"] = top_p.into();
+        }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
         }
         data["total_tokens"] = tokens.into();
-        if let Some(conext_window) = self.model.max_input_tokens {
-            data["max_input_tokens"] = conext_window.into();
+        if let Some(context_window) = self.model.max_input_tokens {
+            data["max_input_tokens"] = context_window.into();
         }
         if percent != 0.0 {
             data["total/max"] = format!("{}%", percent).into();
@@ -139,6 +148,9 @@ impl Session {
 
         if let Some(temperature) = self.temperature() {
             items.push(("temperature", temperature.to_string()));
+        }
+        if let Some(top_p) = self.top_p() {
+            items.push(("top_p", top_p.to_string()));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -203,6 +215,13 @@ impl Session {
     pub fn set_temperature(&mut self, value: Option<f64>) {
         if self.temperature != value {
             self.temperature = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_top_p(&mut self, value: Option<f64>) {
+        if self.top_p != value {
+            self.top_p = value;
             self.dirty = true;
         }
     }
@@ -304,11 +323,11 @@ impl Session {
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
-        let messages = self.build_emssages(input);
+        let messages = self.build_messages(input);
         serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
     }
 
-    pub fn build_emssages(&self, input: &Input) -> Vec<Message> {
+    pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let mut messages = self.messages.clone();
         let mut need_add_msg = true;
         let len = messages.len();

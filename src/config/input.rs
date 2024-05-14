@@ -2,10 +2,9 @@ use super::role::Role;
 use super::session::Session;
 
 use crate::client::{ImageUrl, MessageContent, MessageContentPart, ModelCapabilities};
-use crate::utils::sha256sum;
+use crate::utils::{base64_encode, sha256};
 
 use anyhow::{bail, Context, Result};
-use base64::{self, engine::general_purpose::STANDARD, Engine};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use mime_guess::from_path;
@@ -56,7 +55,7 @@ impl Input {
                     if is_image {
                         let data_url = read_media_to_data_url(&file_path)
                             .with_context(|| format!("Unable to read media file '{file_item}'"))?;
-                        data_urls.insert(sha256sum(&data_url), file_path.display().to_string());
+                        data_urls.insert(sha256(&data_url), file_path.display().to_string());
                         medias.push(data_url)
                     } else {
                         let text = read_file(&file_path)
@@ -94,12 +93,20 @@ impl Input {
         self.data_urls.clone()
     }
 
+    pub fn text(&self) -> String {
+        self.text.clone()
+    }
+
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+    }
+
     pub fn role(&self) -> Option<&Role> {
         self.context.role.as_ref()
     }
 
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
-        if self.context.in_session {
+        if self.context.session {
             session.as_ref()
         } else {
             None
@@ -107,7 +114,7 @@ impl Input {
     }
 
     pub fn session_mut<'a>(&self, session: &'a mut Option<Session>) -> Option<&'a mut Session> {
-        if self.context.in_session {
+        if self.context.session {
             session.as_mut()
         } else {
             None
@@ -192,18 +199,25 @@ impl Input {
 #[derive(Debug, Clone, Default)]
 pub struct InputContext {
     role: Option<Role>,
-    in_session: bool,
+    session: bool,
 }
 
 impl InputContext {
-    pub fn new(role: Option<Role>, in_session: bool) -> Self {
-        Self { role, in_session }
+    pub fn new(role: Option<Role>, session: bool) -> Self {
+        Self { role, session }
+    }
+
+    pub fn role(role: Role) -> Self {
+        Self {
+            role: Some(role),
+            session: false,
+        }
     }
 }
 
 pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -> String {
     if data_url.starts_with("data:") {
-        let hash = sha256sum(&data_url);
+        let hash = sha256(&data_url);
         if let Some(path) = data_urls.get(&hash) {
             return path.to_string();
         }
@@ -243,7 +257,7 @@ fn read_media_to_data_url<P: AsRef<Path>>(image_path: P) -> Result<String> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
-    let encoded_image = STANDARD.encode(buffer);
+    let encoded_image = base64_encode(buffer);
     let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
 
     Ok(data_url)

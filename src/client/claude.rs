@@ -1,77 +1,35 @@
-use super::{patch_system_message, ClaudeClient, Client, ExtraConfig, Model, PromptType, SendData};
-
-use crate::{
-    client::{ImageUrl, MessageContent, MessageContentPart},
-    render::ReplyHandler,
-    utils::PromptKind,
+use super::{
+    catch_error, extract_system_message, sse_stream, ClaudeClient, CompletionDetails, ExtraConfig,
+    ImageUrl, MessageContent, MessageContentPart, Model, ModelConfig, PromptAction, PromptKind,
+    SendData, SsMmessage, SseHandler,
 };
 
 use anyhow::{anyhow, bail, Result};
-use async_trait::async_trait;
-use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
-use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.anthropic.com/v1/messages";
 
-const MODELS: [(&str, usize, &str); 3] = [
-    // https://docs.anthropic.com/claude/docs/models-overview
-    ("claude-3-opus-20240229", 200000, "text,vision"),
-    ("claude-3-sonnet-20240229", 200000, "text,vision"),
-    ("claude-3-haiku-20240307", 200000, "text,vision"),
-];
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
-}
-
-#[async_trait]
-impl Client for ClaudeClient {
-    client_common_fns!();
-
-    async fn send_message_inner(&self, client: &ReqwestClient, data: SendData) -> Result<String> {
-        let builder = self.request_builder(client, data)?;
-        send_message(builder).await
-    }
-
-    async fn send_message_streaming_inner(
-        &self,
-        client: &ReqwestClient,
-        handler: &mut ReplyHandler,
-        data: SendData,
-    ) -> Result<()> {
-        let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler).await
-    }
 }
 
 impl ClaudeClient {
     config_get_fn!(api_key, get_api_key);
 
-    pub const PROMPTS: [PromptType<'static>; 1] =
-        [("api_key", "API Key:", false, PromptKind::String)];
-
-    pub fn list_models(local_config: &ClaudeConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, max_input_tokens, capabilities)| {
-                Model::new(client_name, name)
-                    .set_capabilities(capabilities.into())
-                    .set_max_input_tokens(Some(max_input_tokens))
-            })
-            .collect()
-    }
+    pub const PROMPTS: [PromptAction<'static>; 1] =
+        [("api_key", "API Key:", true, PromptKind::String)];
 
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
         let api_key = self.get_api_key().ok();
 
-        let body = build_body(data, self.model.name.clone())?;
+        let body = claude_build_body(data, &self.model)?;
 
         let url = API_BASE;
 
@@ -87,61 +45,50 @@ impl ClaudeClient {
     }
 }
 
-async fn send_message(builder: RequestBuilder) -> Result<String> {
-    let data: Value = builder.send().await?.json().await?;
-    check_error(&data)?;
+impl_client_trait!(
+    ClaudeClient,
+    claude_send_message,
+    claude_send_message_streaming
+);
 
-    let output = data["content"][0]["text"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-
-    Ok(output.to_string())
+pub async fn claude_send_message(builder: RequestBuilder) -> Result<(String, CompletionDetails)> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+    claude_extract_completion(&data)
 }
 
-async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHandler) -> Result<()> {
-    let mut es = builder.eventsource()?;
-    while let Some(event) = es.next().await {
-        match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                let data: Value = serde_json::from_str(&message.data)?;
-                check_error(&data)?;
-                if let Some(typ) = data["type"].as_str() {
-                    if typ == "content_block_delta" {
-                        if let Some(text) = data["delta"]["text"].as_str() {
-                            handler.text(text)?;
-                        }
-                    }
+pub async fn claude_send_message_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    let handle = |message: SsMmessage| -> Result<bool> {
+        let data: Value = serde_json::from_str(&message.data)?;
+        if let Some(typ) = data["type"].as_str() {
+            if typ == "content_block_delta" {
+                if let Some(text) = data["delta"]["text"].as_str() {
+                    handler.text(text)?;
                 }
-            }
-            Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {}
-                    EventSourceError::InvalidStatusCode(code, res) => {
-                        let data: Value = res.json().await?;
-                        check_error(&data)?;
-                        bail!("Invalid status code: {code}");
-                    }
-                    _ => {
-                        bail!("{}", err);
-                    }
-                }
-                es.close();
             }
         }
-    }
+        Ok(false)
+    };
 
-    Ok(())
+    sse_stream(builder, handle).await
 }
 
-fn build_body(data: SendData, model: String) -> Result<Value> {
+pub fn claude_build_body(data: SendData, model: &Model) -> Result<Value> {
     let SendData {
         mut messages,
         temperature,
+        top_p,
         stream,
     } = data;
 
-    patch_system_message(&mut messages);
+    let system_message = extract_system_message(&mut messages);
 
     let mut network_image_urls = vec![];
     let messages: Vec<Value> = messages
@@ -189,13 +136,20 @@ fn build_body(data: SendData, model: String) -> Result<Value> {
     }
 
     let mut body = json!({
-        "model": model,
-        "max_tokens": 4096,
+        "model": &model.name,
         "messages": messages,
     });
-
+    if let Some(v) = system_message {
+        body["system"] = v.into();
+    }
+    if let Some(v) = model.max_tokens_param() {
+        body["max_tokens"] = v.into();
+    }
     if let Some(v) = temperature {
         body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
     }
     if stream {
         body["stream"] = true.into();
@@ -203,13 +157,15 @@ fn build_body(data: SendData, model: String) -> Result<Value> {
     Ok(body)
 }
 
-fn check_error(data: &Value) -> Result<()> {
-    if let Some(error) = data["error"].as_object() {
-        if let (Some(typ), Some(message)) = (error["type"].as_str(), error["message"].as_str()) {
-            bail!("{typ}: {message}");
-        } else {
-            bail!("{}", Value::Object(error.clone()))
-        }
-    }
-    Ok(())
+pub fn claude_extract_completion(data: &Value) -> Result<(String, CompletionDetails)> {
+    let text = data["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
+
+    let details = CompletionDetails {
+        id: data["id"].as_str().map(|v| v.to_string()),
+        input_tokens: data["usage"]["input_tokens"].as_u64(),
+        output_tokens: data["usage"]["output_tokens"].as_u64(),
+    };
+    Ok((text.to_string(), details))
 }
