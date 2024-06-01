@@ -1,6 +1,7 @@
 use super::{
-    maybe_catch_error, message::*, sse_stream, Client, CompletionDetails, ExtraConfig, Model,
-    ModelConfig, PromptAction, PromptKind, QianwenClient, SendData, SsMmessage, SseHandler,
+    maybe_catch_error, message::*, sse_stream, Client, CompletionData, CompletionOutput,
+    ExtraConfig, Model, ModelData, ModelPatches, PromptAction, PromptKind, QianwenClient,
+    SseHandler, SseMmessage,
 };
 
 use crate::utils::{base64_decode, sha256};
@@ -26,7 +27,8 @@ pub struct QianwenConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -36,17 +38,21 @@ impl QianwenClient {
     pub const PROMPTS: [PromptAction<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
 
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+    fn request_builder(
+        &self,
+        client: &ReqwestClient,
+        data: CompletionData,
+    ) -> Result<RequestBuilder> {
         let api_key = self.get_api_key()?;
 
         let stream = data.stream;
 
-        let is_vl = self.is_vl();
-        let url = match is_vl {
+        let url = match self.model.supports_vision() {
             true => API_URL_VL,
             false => API_URL,
         };
-        let (body, has_upload) = build_body(data, &self.model, is_vl)?;
+        let (mut body, has_upload) = build_body(data, &self.model)?;
+        self.patch_request_body(&mut body);
 
         debug!("Qianwen Request: {url} {body}");
 
@@ -60,10 +66,6 @@ impl QianwenClient {
 
         Ok(builder)
     }
-
-    fn is_vl(&self) -> bool {
-        self.model.name.starts_with("qwen-vl")
-    }
 }
 
 #[async_trait]
@@ -73,43 +75,50 @@ impl Client for QianwenClient {
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        mut data: SendData,
-    ) -> Result<(String, CompletionDetails)> {
+        mut data: CompletionData,
+    ) -> Result<CompletionOutput> {
         let api_key = self.get_api_key()?;
-        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
+        patch_messages(self.model.name(), &api_key, &mut data.messages).await?;
         let builder = self.request_builder(client, data)?;
-        send_message(builder, self.is_vl()).await
+        send_message(builder, &self.model).await
     }
 
     async fn send_message_streaming_inner(
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        mut data: SendData,
+        mut data: CompletionData,
     ) -> Result<()> {
         let api_key = self.get_api_key()?;
-        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
+        patch_messages(self.model.name(), &api_key, &mut data.messages).await?;
         let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler, self.is_vl()).await
+        send_message_streaming(builder, handler, &self.model).await
     }
 }
 
-async fn send_message(builder: RequestBuilder, is_vl: bool) -> Result<(String, CompletionDetails)> {
+async fn send_message(builder: RequestBuilder, model: &Model) -> Result<CompletionOutput> {
     let data: Value = builder.send().await?.json().await?;
     maybe_catch_error(&data)?;
 
-    extract_completion_text(&data, is_vl)
+    debug!("non-stream-data: {data}");
+    extract_completion_text(&data, model)
 }
 
 async fn send_message_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
-    is_vl: bool,
+    model: &Model,
 ) -> Result<()> {
-    let handle = |message: SsMmessage| -> Result<bool> {
+    let model_name = model.name();
+    let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         maybe_catch_error(&data)?;
-        if is_vl {
+        debug!("stream-data: {data}");
+        if model_name == "qwen-long" {
+            if let Some(text) = data["output"]["choices"][0]["message"]["content"].as_str() {
+                handler.text(text)?;
+            }
+        } else if model.supports_vision() {
             if let Some(text) =
                 data["output"]["choices"][0]["message"]["content"][0]["text"].as_str()
             {
@@ -124,16 +133,18 @@ async fn send_message_streaming(
     sse_stream(builder, handle).await
 }
 
-fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool)> {
-    let SendData {
+fn build_body(data: CompletionData, model: &Model) -> Result<(Value, bool)> {
+    let CompletionData {
         messages,
         temperature,
         top_p,
+        functions: _,
         stream,
     } = data;
 
     let mut has_upload = false;
-    let input = if is_vl {
+    let mut is_tool_call = false;
+    let input = if model.supports_vision() {
         let messages: Vec<Value> = messages
             .into_iter()
             .map(|message| {
@@ -154,6 +165,10 @@ fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool
                             }
                         })
                         .collect(),
+                    MessageContent::ToolResults(_) => {
+                        is_tool_call = true;
+                        vec![]
+                    }
                 };
                 json!({ "role": role, "content": content })
             })
@@ -167,6 +182,9 @@ fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool
             "messages": messages,
         })
     };
+    if is_tool_call {
+        bail!("The client does not support function calling",);
+    }
 
     let mut parameters = json!({});
     if stream {
@@ -184,7 +202,7 @@ fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool
     }
 
     let body = json!({
-        "model": &model.name,
+        "model": &model.name(),
         "input": input,
         "parameters": parameters
     });
@@ -192,22 +210,28 @@ fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool
     Ok((body, has_upload))
 }
 
-fn extract_completion_text(data: &Value, is_vl: bool) -> Result<(String, CompletionDetails)> {
+fn extract_completion_text(data: &Value, model: &Model) -> Result<CompletionOutput> {
     let err = || anyhow!("Invalid response data: {data}");
-    let text = if is_vl {
+    let text = if model.name() == "qwen-long" {
+        data["output"]["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(err)?
+    } else if model.supports_vision() {
         data["output"]["choices"][0]["message"]["content"][0]["text"]
             .as_str()
             .ok_or_else(err)?
     } else {
         data["output"]["text"].as_str().ok_or_else(err)?
     };
-    let details = CompletionDetails {
+    let output = CompletionOutput {
+        text: text.to_string(),
+        tool_calls: vec![],
         id: data["request_id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
     };
 
-    Ok((text.to_string(), details))
+    Ok(output)
 }
 
 /// Patch messages, upload embedded images to oss

@@ -1,6 +1,7 @@
 use super::Input;
+
 use crate::{
-    client::{Message, MessageContent, MessageRole},
+    client::{Message, MessageContent, MessageRole, Model},
     utils::{detect_os, detect_shell},
 };
 
@@ -18,8 +19,17 @@ pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 pub struct Role {
     pub name: String,
     pub prompt: String,
+    #[serde(
+        rename(serialize = "model", deserialize = "model"),
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_matcher: Option<String>,
 }
 
 impl Role {
@@ -28,13 +38,15 @@ impl Role {
             name: TEMP_ROLE.into(),
             prompt: prompt.into(),
             temperature: None,
+            model_id: None,
             top_p: None,
+            function_matcher: None,
         }
     }
 
     pub fn builtin() -> Vec<Role> {
         [
-            (SHELL_ROLE, shell_prompt()),
+            (SHELL_ROLE, shell_prompt(), None),
             (
                 EXPLAIN_SHELL_ROLE,
                 r#"Provide a terse, single sentence description of the given shell command.
@@ -42,6 +54,7 @@ Describe each argument and option of the command.
 Provide short responses in about 80 words.
 APPLY MARKDOWN formatting when possible."#
                     .into(),
+                None,
             ),
             (
                 CODE_ROLE,
@@ -56,14 +69,18 @@ async function timeout(ms) {
 ```
 "#
                 .into(),
+                None,
             ),
+            ("%functions%", String::new(), Some(".*".into())),
         ]
         .into_iter()
-        .map(|(name, prompt)| Self {
+        .map(|(name, prompt, function_matcher)| Self {
             name: name.into(),
             prompt,
+            model_id: None,
             temperature: None,
             top_p: None,
+            function_matcher,
         })
         .collect()
     }
@@ -74,8 +91,16 @@ async function timeout(ms) {
         Ok(output.trim_end().to_string())
     }
 
-    pub fn embedded(&self) -> bool {
+    pub fn empty_prompt(&self) -> bool {
+        self.prompt.is_empty()
+    }
+
+    pub fn embedded_prompt(&self) -> bool {
         self.prompt.contains(INPUT_PLACEHOLDER)
+    }
+
+    pub fn set_model(&mut self, model: &Model) {
+        self.model_id = Some(model.id());
     }
 
     pub fn set_temperature(&mut self, value: Option<f64>) {
@@ -103,7 +128,9 @@ async function timeout(ms) {
 
     pub fn echo_messages(&self, input: &Input) -> String {
         let input_markdown = input.render();
-        if self.embedded() {
+        if self.empty_prompt() {
+            input_markdown
+        } else if self.embedded_prompt() {
             self.prompt.replace(INPUT_PLACEHOLDER, &input_markdown)
         } else {
             format!("{}\n\n{}", self.prompt, input.render())
@@ -111,41 +138,30 @@ async function timeout(ms) {
     }
 
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
-        let mut content = input.to_message_content();
-
-        if self.embedded() {
+        let mut content = input.message_content();
+        if self.empty_prompt() {
+            vec![Message::new(MessageRole::User, content)]
+        } else if self.embedded_prompt() {
             content.merge_prompt(|v: &str| self.prompt.replace(INPUT_PLACEHOLDER, v));
-            vec![Message {
-                role: MessageRole::User,
-                content,
-            }]
+            vec![Message::new(MessageRole::User, content)]
         } else {
             let mut messages = vec![];
             let (system, cases) = parse_structure_prompt(&self.prompt);
             if !system.is_empty() {
-                messages.push(Message {
-                    role: MessageRole::System,
-                    content: MessageContent::Text(system.to_string()),
-                })
+                messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(system.to_string()),
+                ));
             }
             if !cases.is_empty() {
                 messages.extend(cases.into_iter().flat_map(|(i, o)| {
                     vec![
-                        Message {
-                            role: MessageRole::User,
-                            content: MessageContent::Text(i.to_string()),
-                        },
-                        Message {
-                            role: MessageRole::Assistant,
-                            content: MessageContent::Text(o.to_string()),
-                        },
+                        Message::new(MessageRole::User, MessageContent::Text(i.to_string())),
+                        Message::new(MessageRole::Assistant, MessageContent::Text(o.to_string())),
                     ]
                 }));
             }
-            messages.push(Message {
-                role: MessageRole::User,
-                content,
-            });
+            messages.push(Message::new(MessageRole::User, content));
             messages
         }
     }
@@ -209,23 +225,16 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
 
 fn shell_prompt() -> String {
     let os = detect_os();
-    let (detected_shell, _, _) = detect_shell();
-    let (shell, use_semicolon) = match (detected_shell.as_str(), os.as_str()) {
-        // GPT doesn’t know much about nushell
-        ("nushell", "windows") => ("cmd", true),
-        ("nushell", _) => ("bash", true),
-        ("powershell", _) => ("powershell", true),
-        ("pwsh", _) => ("powershell", false),
-        _ => (detected_shell.as_str(), false),
-    };
-    let combine = if use_semicolon {
+    let shell = detect_shell();
+    let shell = shell.name.as_str();
+    let combinator = if shell == "powershell" {
         "\nIf multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
     } else {
         "\nIf multiple steps required try to combine them together using '&&'.".to_string()
     };
     format!(
         r#"Provide only {shell} commands for {os} without any description.
-Ensure the output is a valid {shell} command. {combine}
+Ensure the output is a valid {shell} command. {combinator}
 If there is a lack of details, provide most logical solution.
 Output plain text only, without any markdown formatting."#
     )

@@ -1,7 +1,10 @@
-use super::role::Role;
-use super::session::Session;
+use super::{role::Role, session::Session, GlobalConfig};
 
-use crate::client::{ImageUrl, MessageContent, MessageContentPart, ModelCapabilities};
+use crate::client::{
+    init_client, list_models, Client, CompletionData, ImageUrl, Message, MessageContent,
+    MessageContentPart, MessageRole, Model,
+};
+use crate::function::{ToolCallResult, ToolResults};
 use crate::utils::{base64_encode, sha256};
 
 use anyhow::{bail, Context, Result};
@@ -24,23 +27,32 @@ lazy_static! {
 
 #[derive(Debug, Clone)]
 pub struct Input {
+    config: GlobalConfig,
     text: String,
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
+    tool_call: Option<ToolResults>,
     context: InputContext,
 }
 
 impl Input {
-    pub fn from_str(text: &str, context: InputContext) -> Self {
+    pub fn from_str(config: &GlobalConfig, text: &str, context: Option<InputContext>) -> Self {
         Self {
+            config: config.clone(),
             text: text.to_string(),
             medias: Default::default(),
             data_urls: Default::default(),
-            context,
+            tool_call: None,
+            context: context.unwrap_or_else(|| InputContext::from_config(config)),
         }
     }
 
-    pub fn new(text: &str, files: Vec<String>, context: InputContext) -> Result<Self> {
+    pub fn new(
+        config: &GlobalConfig,
+        text: &str,
+        files: Vec<String>,
+        context: Option<InputContext>,
+    ) -> Result<Self> {
         let mut texts = vec![text.to_string()];
         let mut medias = vec![];
         let mut data_urls = HashMap::new();
@@ -78,10 +90,12 @@ impl Input {
         }
 
         Ok(Self {
+            config: config.clone(),
             text: texts.join("\n"),
             medias,
             data_urls,
-            context,
+            tool_call: Default::default(),
+            context: context.unwrap_or_else(|| InputContext::from_config(config)),
         })
     }
 
@@ -99,6 +113,103 @@ impl Input {
 
     pub fn set_text(&mut self, text: String) {
         self.text = text;
+    }
+
+    pub fn merge_tool_call(
+        mut self,
+        output: String,
+        tool_call_results: Vec<ToolCallResult>,
+    ) -> Self {
+        match self.tool_call.as_mut() {
+            Some(exist_tool_call_results) => {
+                exist_tool_call_results.0.extend(tool_call_results);
+                exist_tool_call_results.1 = output;
+            }
+            None => self.tool_call = Some((tool_call_results, output)),
+        }
+        self
+    }
+
+    pub fn model(&self) -> Model {
+        let model = self.config.read().model.clone();
+        if let Some(model_id) = self.role().and_then(|v| v.model_id.clone()) {
+            if model.id() != model_id {
+                if let Some(model) = list_models(&self.config.read())
+                    .into_iter()
+                    .find(|v| v.id() == model_id)
+                {
+                    return model.clone();
+                }
+            }
+        };
+        model
+    }
+
+    pub fn create_client(&self) -> Result<Box<dyn Client>> {
+        init_client(&self.config, Some(self.model()))
+    }
+
+    pub fn prepare_completion_data(&self, model: &Model, stream: bool) -> Result<CompletionData> {
+        if !self.medias.is_empty() && !model.supports_vision() {
+            bail!("The current model does not support vision.");
+        }
+        let messages = self.build_messages()?;
+        self.config.read().model.max_input_tokens_limit(&messages)?;
+        let (temperature, top_p) = if let Some(session) = self.session(&self.config.read().session)
+        {
+            (session.temperature(), session.top_p())
+        } else if let Some(role) = self.role() {
+            (role.temperature, role.top_p)
+        } else {
+            let config = self.config.read();
+            (config.temperature, config.top_p)
+        };
+        let mut functions = None;
+        if self.config.read().function_calling && model.supports_function_calling() {
+            let config = self.config.read();
+            let function_matcher = if let Some(session) = self.session(&config.session) {
+                session.function_matcher()
+            } else if let Some(role) = self.role() {
+                role.function_matcher.as_deref()
+            } else {
+                None
+            };
+            functions = config.function.select(function_matcher);
+        };
+        Ok(CompletionData {
+            messages,
+            temperature,
+            top_p,
+            functions,
+            stream,
+        })
+    }
+
+    pub fn build_messages(&self) -> Result<Vec<Message>> {
+        let mut messages = if let Some(session) = self.session(&self.config.read().session) {
+            session.build_messages(self)
+        } else if let Some(role) = self.role() {
+            role.build_messages(self)
+        } else {
+            vec![Message::new(MessageRole::User, self.message_content())]
+        };
+        if let Some(tool_results) = &self.tool_call {
+            messages.push(Message::new(
+                MessageRole::Assistant,
+                MessageContent::ToolResults(tool_results.clone()),
+            ))
+        }
+        Ok(messages)
+    }
+
+    pub fn echo_messages(&self) -> String {
+        if let Some(session) = self.session(&self.config.read().session) {
+            session.echo_messages(self)
+        } else if let Some(role) = self.role() {
+            role.echo_messages(self)
+        } else {
+            self.render()
+        }
     }
 
     pub fn role(&self) -> Option<&Role> {
@@ -163,7 +274,7 @@ impl Input {
         format!(".file {}{}", files.join(" "), text)
     }
 
-    pub fn to_message_content(&self) -> MessageContent {
+    pub fn message_content(&self) -> MessageContent {
         if self.medias.is_empty() {
             MessageContent::Text(self.text.clone())
         } else {
@@ -186,14 +297,6 @@ impl Input {
             MessageContent::Array(list)
         }
     }
-
-    pub fn required_capabilities(&self) -> ModelCapabilities {
-        if !self.medias.is_empty() {
-            ModelCapabilities::Vision
-        } else {
-            ModelCapabilities::Text
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +308,11 @@ pub struct InputContext {
 impl InputContext {
     pub fn new(role: Option<Role>, session: bool) -> Self {
         Self { role, session }
+    }
+
+    pub fn from_config(config: &GlobalConfig) -> Self {
+        let config = config.read();
+        InputContext::new(config.role.clone(), config.session.is_some())
     }
 
     pub fn role(role: Role) -> Self {

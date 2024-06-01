@@ -1,10 +1,9 @@
 use super::{
-    catch_error, message::*, CompletionDetails, ExtraConfig, Model, ModelConfig, OllamaClient,
-    PromptAction, PromptKind, SendData, SseHandler,
+    catch_error, json_stream, message::*, Client, CompletionData, CompletionOutput, ExtraConfig,
+    Model, ModelData, ModelPatches, OllamaClient, PromptAction, PromptKind, SseHandler,
 };
 
 use anyhow::{anyhow, bail, Result};
-use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -15,7 +14,8 @@ pub struct OllamaConfig {
     pub api_base: Option<String>,
     pub api_auth: Option<String>,
     pub chat_endpoint: Option<String>,
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -35,12 +35,16 @@ impl OllamaClient {
         ),
     ];
 
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+    fn request_builder(
+        &self,
+        client: &ReqwestClient,
+        data: CompletionData,
+    ) -> Result<RequestBuilder> {
         let api_base = self.get_api_base()?;
         let api_auth = self.get_api_auth().ok();
 
         let mut body = build_body(data, &self.model)?;
-        self.model.merge_extra_fields(&mut body);
+        self.patch_request_body(&mut body);
 
         let chat_endpoint = self.config.chat_endpoint.as_deref().unwrap_or("/api/chat");
 
@@ -59,17 +63,18 @@ impl OllamaClient {
 
 impl_client_trait!(OllamaClient, send_message, send_message_streaming);
 
-async fn send_message(builder: RequestBuilder) -> Result<(String, CompletionDetails)> {
+async fn send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data = res.json().await?;
     if !status.is_success() {
         catch_error(&data, status.as_u16())?;
     }
+    debug!("non-stream-data: {data}");
     let text = data["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    Ok((text.to_string(), CompletionDetails::default()))
+    Ok(CompletionOutput::new(text))
 }
 
 async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandler) -> Result<()> {
@@ -79,13 +84,10 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandle
         let data = res.json().await?;
         catch_error(&data, status.as_u16())?;
     } else {
-        let mut stream = res.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if chunk.is_empty() {
-                continue;
-            }
-            let data: Value = serde_json::from_slice(&chunk)?;
+        let handle = |message: &str| -> Result<()> {
+            let data: Value = serde_json::from_str(message)?;
+            debug!("stream-data: {data}");
+
             if data["done"].is_boolean() {
                 if let Some(text) = data["message"]["content"].as_str() {
                     handler.text(text)?;
@@ -93,20 +95,28 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandle
             } else {
                 bail!("Invalid response data: {data}")
             }
-        }
+
+            Ok(())
+        };
+
+        json_stream(res.bytes_stream(), handle).await?;
     }
+
     Ok(())
 }
 
-fn build_body(data: SendData, model: &Model) -> Result<Value> {
-    let SendData {
+fn build_body(data: CompletionData, model: &Model) -> Result<Value> {
+    let CompletionData {
         messages,
         temperature,
         top_p,
+        functions: _,
         stream,
     } = data;
 
+    let mut is_tool_call = false;
     let mut network_image_urls = vec![];
+
     let messages: Vec<Value> = messages
         .into_iter()
         .map(|message| {
@@ -141,9 +151,17 @@ fn build_body(data: SendData, model: &Model) -> Result<Value> {
                     let content = content.join("\n\n");
                     json!({ "role": role, "content": content, "images": images })
                 }
+                MessageContent::ToolResults(_) => {
+                    is_tool_call = true;
+                    json!({ "role": role })
+                }
             }
         })
         .collect();
+
+    if is_tool_call {
+        bail!("The client does not support function calling",);
+    }
 
     if !network_image_urls.is_empty() {
         bail!(
@@ -153,7 +171,7 @@ fn build_body(data: SendData, model: &Model) -> Result<Value> {
     }
 
     let mut body = json!({
-        "model": &model.name,
+        "model": &model.name(),
         "messages": messages,
         "stream": stream,
         "options": {},

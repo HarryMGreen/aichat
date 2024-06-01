@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod config;
+mod function;
 mod logger;
 mod render;
 mod repl;
@@ -12,20 +13,23 @@ mod utils;
 extern crate log;
 
 use crate::cli::Cli;
-use crate::client::{ensure_model_capabilities, init_client, list_models, send_stream};
+use crate::client::{list_models, send_stream, CompletionOutput};
 use crate::config::{
     Config, GlobalConfig, Input, InputContext, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE,
     SHELL_ROLE,
 };
+use crate::function::eval_tool_calls;
 use crate::render::{render_error, MarkdownRender};
 use crate::repl::Repl;
 use crate::utils::{
-    cl100k_base_singleton, create_abort_signal, extract_block, run_command, run_spinner,
+    create_abort_signal, detect_shell, extract_block, run_command, run_spinner, Shell,
     CODE_BLOCK_RE,
 };
 
 use anyhow::{bail, Result};
+use async_recursion::async_recursion;
 use clap::Parser;
+use function::need_send_call_results;
 use inquire::{Select, Text};
 use is_terminal::IsTerminal;
 use parking_lot::RwLock;
@@ -38,6 +42,7 @@ use tokio::sync::oneshot;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let text = cli.text();
+    let text = aggregate_text(text)?;
     let file = &cli.file;
     let no_input = text.is_none() && file.is_empty();
     let working_mode = if cli.serve.is_some() {
@@ -97,6 +102,7 @@ async fn main() -> Result<()> {
     }
     if let Some(model) = &cli.model {
         config.write().set_model(model)?;
+        config.write().set_model_id();
     }
     if cli.save_session {
         config.write().set_save_session(Some(true));
@@ -109,13 +115,13 @@ async fn main() -> Result<()> {
         println!("{}", info);
         return Ok(());
     }
-    let text = aggregate_text(text)?;
     if cli.execute {
         if no_input {
             bail!("No input");
         }
         let input = create_input(&config, text, file)?;
-        execute(&config, input).await?;
+        let shell = detect_shell();
+        shell_execute(&config, &shell, input).await?;
         return Ok(());
     }
     config.write().apply_prelude()?;
@@ -127,57 +133,72 @@ async fn main() -> Result<()> {
         true => start_interactive(&config).await,
     } {
         let highlight = stderr().is_terminal() && config.read().highlight;
-        render_error(err, highlight)
+        render_error(err, highlight);
+        std::process::exit(1);
     }
     Ok(())
 }
 
+#[async_recursion]
 async fn start_directive(
     config: &GlobalConfig,
     input: Input,
     no_stream: bool,
     code_mode: bool,
 ) -> Result<()> {
-    let mut client = init_client(config)?;
-    ensure_model_capabilities(client.as_mut(), input.required_capabilities())?;
-    config.read().maybe_print_send_tokens(&input);
+    let client = input.create_client()?;
     let is_terminal_stdout = stdout().is_terminal();
     let extract_code = !is_terminal_stdout && code_mode;
-    let output = if no_stream || extract_code {
-        let (output, _) = client.send_message(input.clone()).await?;
-        let output = if extract_code && output.trim_start().starts_with("```") {
-            extract_block(&output)
+    let (output, tool_call_results) = if no_stream || extract_code {
+        let CompletionOutput {
+            text, tool_calls, ..
+        } = client.send_message(input.clone()).await?;
+        if !tool_calls.is_empty() {
+            (String::new(), eval_tool_calls(config, tool_calls)?)
         } else {
-            output.clone()
-        };
-        if is_terminal_stdout {
-            let render_options = config.read().get_render_options()?;
-            let mut markdown_render = MarkdownRender::init(render_options)?;
-            println!("{}", markdown_render.render(&output).trim());
-        } else {
-            println!("{}", output);
+            let text = if extract_code && text.trim_start().starts_with("```") {
+                extract_block(&text)
+            } else {
+                text.clone()
+            };
+            if is_terminal_stdout {
+                let render_options = config.read().get_render_options()?;
+                let mut markdown_render = MarkdownRender::init(render_options)?;
+                println!("{}", markdown_render.render(&text).trim());
+            } else {
+                println!("{}", text);
+            }
+            (text, vec![])
         }
-        output
     } else {
         let abort = create_abort_signal();
         send_stream(&input, client.as_ref(), config, abort).await?
     };
-    // Save the message/session
-    config.write().save_message(input, &output)?;
+    config
+        .write()
+        .save_message(&input, &output, &tool_call_results)?;
     config.write().end_session()?;
-    Ok(())
+    if need_send_call_results(&tool_call_results) {
+        start_directive(
+            config,
+            input.merge_tool_call(output, tool_call_results),
+            no_stream,
+            code_mode,
+        )
+        .await
+    } else {
+        Ok(())
+    }
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
-    cl100k_base_singleton();
     let mut repl: Repl = Repl::init(config)?;
     repl.run().await
 }
 
 #[async_recursion::async_recursion]
-async fn execute(config: &GlobalConfig, mut input: Input) -> Result<()> {
-    let client = init_client(config)?;
-    config.read().maybe_print_send_tokens(&input);
+async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -> Result<()> {
+    let client = input.create_client()?;
     let is_terminal_stdout = stdout().is_terminal();
     let ret = if is_terminal_stdout {
         let (spinner_tx, spinner_rx) = oneshot::channel();
@@ -188,11 +209,11 @@ async fn execute(config: &GlobalConfig, mut input: Input) -> Result<()> {
     } else {
         client.send_message(input.clone()).await
     };
-    let (mut eval_str, _) = ret?;
+    let mut eval_str = ret?.text;
     if let Ok(true) = CODE_BLOCK_RE.is_match(&eval_str) {
         eval_str = extract_block(&eval_str);
     }
-    config.write().save_message(input.clone(), &eval_str)?;
+    config.write().save_message(&input, &eval_str, &[])?;
     config.read().maybe_copy(&eval_str);
     let render_options = config.read().get_render_options()?;
     let mut markdown_render = MarkdownRender::init(render_options)?;
@@ -203,27 +224,28 @@ async fn execute(config: &GlobalConfig, mut input: Input) -> Result<()> {
     if is_terminal_stdout {
         loop {
             let answer = Select::new(
-                markdown_render.render(&eval_str).trim(),
-                vec!["✅ Execute", "🤔 Revise", "📙 Explain", "❌ Cancel"],
+                eval_str.trim(),
+                vec!["✅ Execute", "🔄️ Revise", "📖 Explain", "❌ Cancel"],
             )
             .prompt()?;
 
             match answer {
                 "✅ Execute" => {
-                    let code = run_command(&eval_str)?;
+                    debug!("{} {:?}", shell.cmd, &[&shell.arg, &eval_str]);
+                    let code = run_command(&shell.cmd, &[&shell.arg, &eval_str], None)?;
                     if code != 0 {
                         process::exit(code);
                     }
                 }
-                "🤔 Revise" => {
+                "🔄️ Revise" => {
                     let revision = Text::new("Enter your revision:").prompt()?;
                     let text = format!("{}\n{revision}", input.text());
                     input.set_text(text);
-                    return execute(config, input).await;
+                    return shell_execute(config, shell, input).await;
                 }
-                "📙 Explain" => {
+                "📖 Explain" => {
                     let role = config.read().retrieve_role(EXPLAIN_SHELL_ROLE)?;
-                    let input = Input::from_str(&eval_str, InputContext::role(role));
+                    let input = Input::from_str(config, &eval_str, Some(InputContext::role(role)));
                     let abort = create_abort_signal();
                     send_stream(&input, client.as_ref(), config, abort).await?;
                     continue;
@@ -254,11 +276,10 @@ fn aggregate_text(text: Option<String>) -> Result<Option<String>> {
 }
 
 fn create_input(config: &GlobalConfig, text: Option<String>, file: &[String]) -> Result<Input> {
-    let input_context = config.read().input_context();
     let input = if file.is_empty() {
-        Input::from_str(&text.unwrap_or_default(), input_context)
+        Input::from_str(config, &text.unwrap_or_default(), None)
     } else {
-        Input::new(&text.unwrap_or_default(), file.to_vec(), input_context)?
+        Input::new(config, &text.unwrap_or_default(), file.to_vec(), None)?
     };
     if input.is_empty() {
         bail!("No input");

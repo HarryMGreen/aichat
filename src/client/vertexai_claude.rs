@@ -1,9 +1,6 @@
-use super::access_token::*;
-use super::claude::{claude_build_body, claude_send_message, claude_send_message_streaming};
-use super::vertexai::prepare_gcloud_access_token;
 use super::{
-    Client, CompletionDetails, ExtraConfig, Model, ModelConfig, PromptAction, PromptKind, SendData,
-    SseHandler, VertexAIClaudeClient,
+    access_token::*, claude::*, vertexai::*, Client, CompletionData, CompletionOutput, ExtraConfig,
+    Model, ModelData, ModelPatches, PromptAction, PromptKind, SseHandler, VertexAIClaudeClient,
 };
 
 use anyhow::Result;
@@ -18,7 +15,8 @@ pub struct VertexAIClaudeConfig {
     pub location: Option<String>,
     pub adc_file: Option<String>,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -31,7 +29,11 @@ impl VertexAIClaudeClient {
         ("location", "Location", true, PromptKind::String),
     ];
 
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+    fn request_builder(
+        &self,
+        client: &ReqwestClient,
+        data: CompletionData,
+    ) -> Result<RequestBuilder> {
         let project_id = self.get_project_id()?;
         let location = self.get_location()?;
         let access_token = get_access_token(self.name())?;
@@ -39,10 +41,11 @@ impl VertexAIClaudeClient {
         let base_url = format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers");
         let url = format!(
             "{base_url}/anthropic/models/{}:streamRawPredict",
-            self.model.name
+            self.model.name()
         );
 
         let mut body = claude_build_body(data, &self.model)?;
+        self.patch_request_body(&mut body);
         if let Some(body_obj) = body.as_object_mut() {
             body_obj.remove("model");
         }
@@ -63,8 +66,8 @@ impl Client for VertexAIClaudeClient {
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        data: SendData,
-    ) -> Result<(String, CompletionDetails)> {
+        data: CompletionData,
+    ) -> Result<CompletionOutput> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let builder = self.request_builder(client, data)?;
         claude_send_message(builder).await
@@ -74,7 +77,7 @@ impl Client for VertexAIClaudeClient {
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: SendData,
+        data: CompletionData,
     ) -> Result<()> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let builder = self.request_builder(client, data)?;

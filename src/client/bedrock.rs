@@ -1,8 +1,7 @@
-use super::claude::{claude_build_body, claude_extract_completion};
 use super::{
-    catch_error, generate_prompt, BedrockClient, Client, CompletionDetails, ExtraConfig, Model,
-    ModelConfig, PromptAction, PromptFormat, PromptKind, SendData, SseHandler,
-    LLAMA3_PROMPT_FORMAT, MISTRAL_PROMPT_FORMAT,
+    catch_error, claude::*, prompt_format::*, BedrockClient, Client, CompletionData,
+    CompletionOutput, ExtraConfig, Model, ModelData, ModelPatches, PromptAction, PromptKind,
+    SseHandler,
 };
 
 use crate::utils::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256};
@@ -30,7 +29,8 @@ pub struct BedrockConfig {
     pub secret_access_key: Option<String>,
     pub region: Option<String>,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -41,9 +41,9 @@ impl Client for BedrockClient {
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        data: SendData,
-    ) -> Result<(String, CompletionDetails)> {
-        let model_category = ModelCategory::from_str(&self.model.name)?;
+        data: CompletionData,
+    ) -> Result<CompletionOutput> {
+        let model_category = ModelCategory::from_str(self.model.name())?;
         let builder = self.request_builder(client, data, &model_category)?;
         send_message(builder, &model_category).await
     }
@@ -52,9 +52,9 @@ impl Client for BedrockClient {
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: SendData,
+        data: CompletionData,
     ) -> Result<()> {
-        let model_category = ModelCategory::from_str(&self.model.name)?;
+        let model_category = ModelCategory::from_str(self.model.name())?;
         let builder = self.request_builder(client, data, &model_category)?;
         send_message_streaming(builder, handler, &model_category).await
     }
@@ -84,14 +84,14 @@ impl BedrockClient {
     fn request_builder(
         &self,
         client: &ReqwestClient,
-        data: SendData,
+        data: CompletionData,
         model_category: &ModelCategory,
     ) -> Result<RequestBuilder> {
         let access_key_id = self.get_access_key_id()?;
         let secret_access_key = self.get_secret_access_key()?;
         let region = self.get_region()?;
 
-        let model_name = &self.model.name;
+        let model_name = &self.model.name();
         let uri = if data.stream {
             format!("/model/{model_name}/invoke-with-response-stream")
         } else {
@@ -102,7 +102,7 @@ impl BedrockClient {
         let headers = IndexMap::new();
 
         let mut body = build_body(data, &self.model, model_category)?;
-        self.model.merge_extra_fields(&mut body);
+        self.patch_request_body(&mut body);
 
         let builder = aws_fetch(
             client,
@@ -129,7 +129,7 @@ impl BedrockClient {
 async fn send_message(
     builder: RequestBuilder,
     model_category: &ModelCategory,
-) -> Result<(String, CompletionDetails)> {
+) -> Result<CompletionOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -138,6 +138,7 @@ async fn send_message(
         catch_error(&data, status.as_u16())?;
     }
 
+    debug!("non-stream-data: {data}");
     match model_category {
         ModelCategory::Anthropic => claude_extract_completion(&data),
         ModelCategory::MetaLlama3 => llama_extract_completion(&data),
@@ -172,7 +173,7 @@ async fn send_message_streaming(
                     let data: Value = decode_chunk(message.payload()).ok_or_else(|| {
                         anyhow!("Invalid chunk data: {}", hex_encode(message.payload()))
                     })?;
-                    // debug!("bedrock chunk: {data}");
+                    debug!("stream-data: {data}");
                     match model_category {
                         ModelCategory::Anthropic => {
                             if let Some(typ) = data["type"].as_str() {
@@ -210,12 +211,17 @@ async fn send_message_streaming(
     Ok(())
 }
 
-fn build_body(data: SendData, model: &Model, model_category: &ModelCategory) -> Result<Value> {
+fn build_body(
+    data: CompletionData,
+    model: &Model,
+    model_category: &ModelCategory,
+) -> Result<Value> {
     match model_category {
         ModelCategory::Anthropic => {
             let mut body = claude_build_body(data, model)?;
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj.remove("model");
+                body_obj.remove("stream");
             }
             body["anthropic_version"] = "bedrock-2023-05-31".into();
             Ok(body)
@@ -225,11 +231,12 @@ fn build_body(data: SendData, model: &Model, model_category: &ModelCategory) -> 
     }
 }
 
-fn meta_llama_build_body(data: SendData, model: &Model, pt: PromptFormat) -> Result<Value> {
-    let SendData {
+fn meta_llama_build_body(data: CompletionData, model: &Model, pt: PromptFormat) -> Result<Value> {
+    let CompletionData {
         messages,
         temperature,
         top_p,
+        functions: _,
         stream: _,
     } = data;
     let prompt = generate_prompt(&messages, pt)?;
@@ -248,11 +255,12 @@ fn meta_llama_build_body(data: SendData, model: &Model, pt: PromptFormat) -> Res
     Ok(body)
 }
 
-fn mistral_build_body(data: SendData, model: &Model) -> Result<Value> {
-    let SendData {
+fn mistral_build_body(data: CompletionData, model: &Model) -> Result<Value> {
+    let CompletionData {
         messages,
         temperature,
         top_p,
+        functions: _,
         stream: _,
     } = data;
     let prompt = generate_prompt(&messages, MISTRAL_PROMPT_FORMAT)?;
@@ -271,23 +279,25 @@ fn mistral_build_body(data: SendData, model: &Model) -> Result<Value> {
     Ok(body)
 }
 
-fn llama_extract_completion(data: &Value) -> Result<(String, CompletionDetails)> {
+fn llama_extract_completion(data: &Value) -> Result<CompletionOutput> {
     let text = data["generation"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    let details = CompletionDetails {
+    let output = CompletionOutput {
+        text: text.to_string(),
+        tool_calls: vec![],
         id: None,
         input_tokens: data["prompt_token_count"].as_u64(),
         output_tokens: data["generation_token_count"].as_u64(),
     };
-    Ok((text.to_string(), details))
+    Ok(output)
 }
 
-fn mistral_extract_completion(data: &Value) -> Result<(String, CompletionDetails)> {
+fn mistral_extract_completion(data: &Value) -> Result<CompletionOutput> {
     let text = data["outputs"][0]["text"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    Ok((text.to_string(), CompletionDetails::default()))
+    Ok(CompletionOutput::new(text))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

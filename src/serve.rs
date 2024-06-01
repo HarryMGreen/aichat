@@ -1,7 +1,7 @@
 use crate::{
     client::{
-        init_client, list_models, ClientConfig, CompletionDetails, Message, Model, SendData,
-        SseEvent, SseHandler,
+        init_client, list_models, ClientConfig, CompletionData, CompletionOutput, Message, Model,
+        ModelData, SseEvent, SseHandler,
     },
     config::{Config, GlobalConfig, Role},
     utils::create_abort_signal,
@@ -57,7 +57,7 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     let stop_server = server.run(listener).await?;
     println!("Chat Completions API: http://{addr}/v1/chat/completions");
     println!("LLM Playground:       http://{addr}/playground");
-    println!("LLM ARENA:            http://{addr}/arena");
+    println!("LLM Arena:            http://{addr}/arena");
     shutdown_signal().await;
     let _ = stop_server.send(());
     Ok(())
@@ -78,7 +78,7 @@ impl Server {
         let roles = config.roles.clone();
         let mut models = list_models(&config);
         let mut default_model = model.clone();
-        default_model.name = DEFAULT_MODEL_NAME.into();
+        default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
         models.insert(0, &default_model);
         let models: Vec<Value> = models
             .into_iter()
@@ -89,14 +89,25 @@ impl Server {
                 } else {
                     model.id()
                 };
+                let ModelData {
+                    max_input_tokens,
+                    max_output_tokens,
+                    pass_max_tokens,
+                    input_price,
+                    output_price,
+                    supports_vision,
+                    supports_function_calling,
+                    ..
+                } = model.data();
                 json!({
                     "id": id,
-                    "max_input_tokens": model.max_input_tokens,
-                    "max_output_tokens": model.max_output_tokens,
-                    "pass_max_tokens": model.pass_max_tokens,
-                    "input_price": model.input_price,
-                    "output_price": model.output_price,
-                    "supports_vision": model.supports_vision(),
+                    "max_input_tokens": max_input_tokens,
+                    "max_output_tokens": max_output_tokens,
+                    "pass_max_tokens": pass_max_tokens,
+                    "input_price": input_price,
+                    "output_price": output_price,
+                    "supports_vision": supports_vision,
+                    "supports_function_calling": supports_function_calling,
                 })
             })
             .collect();
@@ -249,7 +260,7 @@ impl Server {
             config.write().set_model(&model_name)?;
         }
 
-        let mut client = init_client(&config)?;
+        let mut client = init_client(&config, None)?;
         if max_tokens.is_some() {
             client.model_mut().set_max_tokens(max_tokens, true);
         }
@@ -259,10 +270,11 @@ impl Server {
         let completion_id = generate_completion_id();
         let created = Utc::now().timestamp();
 
-        let send_data: SendData = SendData {
+        let completion_data: CompletionData = CompletionData {
             messages,
             temperature,
             top_p,
+            functions: None,
             stream,
         };
 
@@ -294,7 +306,7 @@ impl Server {
                 }
                 tokio::select! {
                     _ = map_event(rx2, &tx, &mut is_first) => {}
-                    ret = client.send_message_streaming_inner(&http_client, &mut handler, send_data) => {
+                    ret = client.send_message_streaming_inner(&http_client, &mut handler, completion_data) => {
                         if let Err(err) = ret {
                             send_first_event(&tx, Some(format!("{err:?}")), &mut is_first)
                         }
@@ -338,7 +350,9 @@ impl Server {
                 .body(BodyExt::boxed(StreamBody::new(stream)))?;
             Ok(res)
         } else {
-            let (content, details) = client.send_message_inner(&http_client, send_data).await?;
+            let output = client
+                .send_message_inner(&http_client, completion_data)
+                .await?;
             let res = Response::builder()
                 .header("Content-Type", "application/json")
                 .body(
@@ -346,8 +360,7 @@ impl Server {
                         &completion_id,
                         &model_name,
                         created,
-                        &content,
-                        &details,
+                        &output,
                     ))
                     .boxed(),
                 )?;
@@ -439,16 +452,10 @@ fn create_frame(id: &str, model: &str, created: i64, content: &str, done: bool) 
     Frame::data(Bytes::from(output))
 }
 
-fn ret_non_stream(
-    id: &str,
-    model: &str,
-    created: i64,
-    content: &str,
-    details: &CompletionDetails,
-) -> Bytes {
-    let id = details.id.as_deref().unwrap_or(id);
-    let input_tokens = details.input_tokens.unwrap_or_default();
-    let output_tokens = details.output_tokens.unwrap_or_default();
+fn ret_non_stream(id: &str, model: &str, created: i64, output: &CompletionOutput) -> Bytes {
+    let id = output.id.as_deref().unwrap_or(id);
+    let input_tokens = output.input_tokens.unwrap_or_default();
+    let output_tokens = output.output_tokens.unwrap_or_default();
     let total_tokens = input_tokens + output_tokens;
     let res_body = json!({
         "id": id,
@@ -460,7 +467,7 @@ fn ret_non_stream(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": content,
+                    "content": output.text,
                 },
                 "logprobs": null,
                 "finish_reason": "stop",

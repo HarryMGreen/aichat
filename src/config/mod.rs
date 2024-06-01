@@ -7,9 +7,10 @@ pub use self::role::{Role, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
 use self::session::{Session, TEMP_SESSION_NAME};
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, Message, Model, SendData,
+    create_client_config, list_client_types, list_models, ClientConfig, Model,
     OPENAI_COMPATIBLE_PLATFORMS,
 };
+use crate::function::{Function, ToolCallResult};
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{
     format_option_value, fuzzy_match, get_env_name, light_theme_from_colorfgbg, now, render_prompt,
@@ -41,6 +42,7 @@ const CONFIG_FILE_NAME: &str = "config.yaml";
 const ROLES_FILE_NAME: &str = "roles.yaml";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
+const FUNCTIONS_DIR_NAME: &str = "functions";
 
 const CLIENTS_FIELD: &str = "clients";
 
@@ -54,7 +56,8 @@ const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_to
 #[serde(default)]
 pub struct Config {
     #[serde(rename(serialize = "model", deserialize = "model"))]
-    pub model_id: Option<String>,
+    #[serde(default)]
+    pub model_id: String,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub dry_run: bool,
@@ -68,6 +71,7 @@ pub struct Config {
     pub keybindings: Keybindings,
     pub prelude: Option<String>,
     pub buffer_editor: Option<String>,
+    pub function_calling: bool,
     pub compress_threshold: usize,
     pub summarize_prompt: Option<String>,
     pub summary_prompt: Option<String>,
@@ -83,6 +87,8 @@ pub struct Config {
     #[serde(skip)]
     pub model: Model,
     #[serde(skip)]
+    pub function: Function,
+    #[serde(skip)]
     pub working_mode: WorkingMode,
     #[serde(skip)]
     pub last_message: Option<(Input, String)>,
@@ -91,7 +97,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_id: None,
+            model_id: Default::default(),
             temperature: None,
             top_p: None,
             save: false,
@@ -105,7 +111,8 @@ impl Default for Config {
             keybindings: Default::default(),
             prelude: None,
             buffer_editor: None,
-            compress_threshold: 2000,
+            function_calling: false,
+            compress_threshold: 4000,
             summarize_prompt: None,
             summary_prompt: None,
             left_prompt: None,
@@ -115,6 +122,7 @@ impl Default for Config {
             role: None,
             session: None,
             model: Default::default(),
+            function: Default::default(),
             working_mode: WorkingMode::Command,
             last_message: None,
         }
@@ -140,6 +148,8 @@ impl Config {
         if let Some(wrap) = config.wrap.clone() {
             config.set_wrap(&wrap)?;
         }
+
+        config.function = Function::init(&Self::functions_dir()?)?;
 
         config.working_mode = working_mode;
         config.load_roles()?;
@@ -211,15 +221,20 @@ impl Config {
         Ok(path)
     }
 
-    pub fn save_message(&mut self, input: Input, output: &str) -> Result<()> {
+    pub fn save_message(
+        &mut self,
+        input: &Input,
+        output: &str,
+        tool_call_results: &[ToolCallResult],
+    ) -> Result<()> {
         self.last_message = Some((input.clone(), output.to_string()));
 
-        if self.dry_run {
+        if self.dry_run || output.is_empty() || !tool_call_results.is_empty() {
             return Ok(());
         }
 
         if let Some(session) = input.session_mut(&mut self.session) {
-            session.add_message(&input, output)?;
+            session.add_message(input, output)?;
             return Ok(());
         }
 
@@ -274,6 +289,10 @@ impl Config {
         Self::local_path(SESSIONS_DIR_NAME)
     }
 
+    pub fn functions_dir() -> Result<PathBuf> {
+        Self::local_path(FUNCTIONS_DIR_NAME)
+    }
+
     pub fn session_file(name: &str) -> Result<PathBuf> {
         let mut path = Self::sessions_dir()?;
         path.push(&format!("{name}.yaml"));
@@ -293,8 +312,10 @@ impl Config {
     pub fn set_role_obj(&mut self, role: Role) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.guard_empty()?;
-            session.set_temperature(role.temperature);
-            session.set_top_p(role.top_p);
+            session.set_role_properties(&role);
+        }
+        if let Some(model_id) = &role.model_id {
+            self.set_model(model_id)?;
         }
         self.role = Some(role);
         Ok(())
@@ -302,10 +323,11 @@ impl Config {
 
     pub fn clear_role(&mut self) -> Result<()> {
         self.role = None;
+        self.restore_model()?;
         Ok(())
     }
 
-    pub fn get_state(&self) -> State {
+    pub fn state(&self) -> State {
         if let Some(session) = &self.session {
             if session.is_empty() {
                 if self.role.is_some() {
@@ -359,28 +381,6 @@ impl Config {
         }
     }
 
-    pub fn echo_messages(&self, input: &Input) -> String {
-        if let Some(session) = input.session(&self.session) {
-            session.echo_messages(input)
-        } else if let Some(role) = input.role() {
-            role.echo_messages(input)
-        } else {
-            input.render()
-        }
-    }
-
-    pub fn build_messages(&self, input: &Input) -> Result<Vec<Message>> {
-        let messages = if let Some(session) = input.session(&self.session) {
-            session.build_messages(input)
-        } else if let Some(role) = input.role() {
-            role.build_messages(input)
-        } else {
-            let message = Message::new(input);
-            vec![message]
-        };
-        Ok(messages)
-    }
-
     pub fn set_wrap(&mut self, value: &str) -> Result<()> {
         if value == "no" {
             self.wrap = None;
@@ -402,12 +402,23 @@ impl Config {
             None => bail!("No model '{}'", value),
             Some(model) => {
                 if let Some(session) = self.session.as_mut() {
-                    session.set_model(model.clone())?;
+                    session.set_model(&model);
+                } else if let Some(role) = self.role.as_mut() {
+                    role.set_model(&model);
                 }
                 self.model = model;
                 Ok(())
             }
         }
+    }
+
+    pub fn set_model_id(&mut self) {
+        self.model_id = self.model.id()
+    }
+
+    pub fn restore_model(&mut self) -> Result<()> {
+        let origin_model_id = self.model_id.clone();
+        self.set_model(&origin_model_id)
     }
 
     pub fn system_info(&self) -> Result<String> {
@@ -416,6 +427,13 @@ impl Config {
             .wrap
             .clone()
             .map_or_else(|| String::from("no"), |v| v.to_string());
+        let (temperature, top_p) = if let Some(session) = &self.session {
+            (session.temperature(), session.top_p())
+        } else if let Some(role) = &self.role {
+            (role.temperature, role.top_p)
+        } else {
+            (self.temperature, self.top_p)
+        };
         let items = vec![
             ("model", self.model.id()),
             (
@@ -425,8 +443,10 @@ impl Config {
                     .map(|v| format!("{v} (current model)"))
                     .unwrap_or_else(|| "-".into()),
             ),
-            ("temperature", format_option_value(&self.temperature)),
-            ("top_p", format_option_value(&self.top_p)),
+            ("temperature", format_option_value(&temperature)),
+            ("top_p", format_option_value(&top_p)),
+            ("function_calling", self.function_calling.to_string()),
+            ("compress_threshold", self.compress_threshold.to_string()),
             ("dry_run", self.dry_run.to_string()),
             ("save", self.save.to_string()),
             ("save_session", format_option_value(&self.save_session)),
@@ -437,11 +457,11 @@ impl Config {
             ("auto_copy", self.auto_copy.to_string()),
             ("keybindings", self.keybindings.stringify().into()),
             ("prelude", format_option_value(&self.prelude)),
-            ("compress_threshold", self.compress_threshold.to_string()),
             ("config_file", display_path(&Self::config_file()?)),
             ("roles_file", display_path(&Self::roles_file()?)),
             ("messages_file", display_path(&Self::messages_file()?)),
             ("sessions_dir", display_path(&Self::sessions_dir()?)),
+            ("functions_dir", display_path(&Self::functions_dir()?)),
         ];
         let output = items
             .iter()
@@ -507,6 +527,7 @@ impl Config {
                     "max_output_tokens",
                     "temperature",
                     "top_p",
+                    "function_calling",
                     "compress_threshold",
                     "save",
                     "save_session",
@@ -522,10 +543,11 @@ impl Config {
             (values, args[0])
         } else if args.len() == 2 {
             let values = match args[0] {
-                "max_output_tokens" => match self.model.max_output_tokens {
+                "max_output_tokens" => match self.model.max_output_tokens() {
                     Some(v) => vec![v.to_string()],
                     None => vec![],
                 },
+                "function_calling" => complete_bool(self.function_calling),
                 "save" => complete_bool(self.save),
                 "save_session" => {
                     let save_session = if let Some(session) = &self.session {
@@ -572,6 +594,10 @@ impl Config {
             "top_p" => {
                 let value = parse_value(value)?;
                 self.set_top_p(value);
+            }
+            "function_calling" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                self.function_calling = value;
             }
             "compress_threshold" => {
                 let value = parse_value(value)?;
@@ -625,7 +651,7 @@ impl Config {
                     self.session = Some(Session::new(self, name));
                 } else {
                     let session = Session::load(name, &session_path)?;
-                    let model_id = session.model().to_string();
+                    let model_id = session.model_id().to_string();
                     self.session = Some(session);
                     self.set_model(&model_id)?;
                 }
@@ -653,7 +679,7 @@ impl Config {
             self.last_message = None;
             let save_session = session.save_session();
             if session.dirty && save_session != Some(false) {
-                if save_session.is_none() || session.is_temp() {
+                if save_session.is_none() {
                     if self.working_mode != WorkingMode::Repl {
                         return Ok(());
                     }
@@ -661,12 +687,13 @@ impl Config {
                     if !ans {
                         return Ok(());
                     }
-                    while session.is_temp() || session.name().is_empty() {
+                    while session.is_temp() {
                         session.name = Text::new("Session name:").prompt()?;
                     }
                 }
                 Self::save_session_to_file(&mut session)?;
             }
+            self.restore_model()?;
         }
         Ok(())
     }
@@ -787,52 +814,17 @@ impl Config {
         render_prompt(right_prompt, &variables)
     }
 
-    pub fn prepare_send_data(&self, input: &Input, stream: bool) -> Result<SendData> {
-        let messages = self.build_messages(input)?;
-        let temperature = if let Some(session) = input.session(&self.session) {
-            session.temperature()
-        } else if let Some(role) = input.role() {
-            role.temperature
-        } else {
-            self.temperature
-        };
-        let top_p = if let Some(session) = input.session(&self.session) {
-            session.top_p()
-        } else if let Some(role) = input.role() {
-            role.top_p
-        } else {
-            self.top_p
-        };
-        self.model.max_input_tokens_limit(&messages)?;
-        Ok(SendData {
-            messages,
-            temperature,
-            top_p,
-            stream,
-        })
-    }
-
-    pub fn input_context(&self) -> InputContext {
-        InputContext::new(self.role.clone(), self.session.is_some())
-    }
-
-    pub fn maybe_print_send_tokens(&self, input: &Input) {
-        if self.dry_run {
-            if let Ok(messages) = self.build_messages(input) {
-                let tokens = self.model.total_tokens(&messages);
-                println!(">>> This message consumes {tokens} tokens. <<<");
-            }
-        }
-    }
-
     fn generate_prompt_context(&self) -> HashMap<&str, String> {
         let mut output = HashMap::new();
         output.insert("model", self.model.id());
-        output.insert("client_name", self.model.client_name.clone());
-        output.insert("model_name", self.model.name.clone());
+        output.insert("client_name", self.model.client_name().to_string());
+        output.insert("model_name", self.model.name().to_string());
         output.insert(
             "max_input_tokens",
-            self.model.max_input_tokens.unwrap_or_default().to_string(),
+            self.model
+                .max_input_tokens()
+                .unwrap_or_default()
+                .to_string(),
         );
         if let Some(temperature) = self.temperature {
             if temperature != 0.0 {
@@ -920,8 +912,8 @@ impl Config {
     }
 
     fn load_config_file(config_path: &Path) -> Result<Self> {
-        let ctx = || format!("Failed to load config at {}", config_path.display());
-        let content = read_to_string(config_path).with_context(ctx)?;
+        let content = read_to_string(config_path)
+            .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
         let config: Self = serde_yaml::from_str(&content).map_err(|err| {
             let err_msg = err.to_string();
             let err_msg = if err_msg.starts_with(&format!("{}: ", CLIENTS_FIELD)) {
@@ -966,16 +958,14 @@ impl Config {
 
     fn load_roles(&mut self) -> Result<()> {
         let path = Self::roles_file()?;
-        if !path.exists() {
-            return Ok(());
-        }
-        let content = read_to_string(&path)
-            .with_context(|| format!("Failed to load roles at {}", path.display()))?;
-        let roles: Vec<Role> =
-            serde_yaml::from_str(&content).with_context(|| "Invalid roles config")?;
-
-        let exist_roles: HashSet<_> = roles.iter().map(|v| v.name.clone()).collect();
-        self.roles = roles;
+        self.roles = if !path.exists() {
+            vec![]
+        } else {
+            let content = read_to_string(&path)
+                .with_context(|| format!("Failed to load roles at {}", path.display()))?;
+            serde_yaml::from_str(&content).with_context(|| "Invalid roles config")?
+        };
+        let exist_roles: HashSet<_> = self.roles.iter().map(|v| v.name.clone()).collect();
         let builtin_roles = Role::builtin();
         for role in builtin_roles {
             if !exist_roles.contains(&role.name) {
@@ -986,18 +976,19 @@ impl Config {
     }
 
     fn setup_model(&mut self) -> Result<()> {
-        let model = match &self.model_id {
-            Some(v) => v.clone(),
-            None => {
-                let models = list_models(self);
-                if models.is_empty() {
-                    bail!("No available model");
-                }
-
-                models[0].id()
+        let model_id = if self.model_id.is_empty() {
+            let models = list_models(self);
+            if models.is_empty() {
+                bail!("No available model");
             }
+
+            let model_id = models[0].id();
+            self.model_id.clone_from(&model_id);
+            model_id
+        } else {
+            self.model_id.clone()
         };
-        self.set_model(&model)?;
+        self.set_model(&model_id)?;
         Ok(())
     }
 
@@ -1105,6 +1096,10 @@ impl State {
 
     pub fn in_role() -> Vec<Self> {
         vec![Self::Role, Self::EmptySessionWithRole]
+    }
+
+    pub fn is_normal(&self) -> bool {
+        self == &Self::Normal
     }
 }
 

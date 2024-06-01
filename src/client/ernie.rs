@@ -1,7 +1,7 @@
-use super::access_token::*;
 use super::{
-    maybe_catch_error, patch_system_message, sse_stream, Client, CompletionDetails, ErnieClient,
-    ExtraConfig, Model, ModelConfig, PromptAction, PromptKind, SendData, SsMmessage, SseHandler,
+    access_token::*, maybe_catch_error, patch_system_message, sse_stream, Client, CompletionData,
+    CompletionOutput, ErnieClient, ExtraConfig, Model, ModelData, ModelPatches, PromptAction,
+    PromptKind, SseHandler, SseMmessage,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +20,8 @@ pub struct ErnieConfig {
     pub api_key: Option<String>,
     pub secret_key: Option<String>,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -30,13 +31,19 @@ impl ErnieClient {
         ("secret_key", "Secret Key:", true, PromptKind::String),
     ];
 
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
-        let body = build_body(data, &self.model);
+    fn request_builder(
+        &self,
+        client: &ReqwestClient,
+        data: CompletionData,
+    ) -> Result<RequestBuilder> {
+        let mut body = build_body(data, &self.model);
+        self.patch_request_body(&mut body);
+
         let access_token = get_access_token(self.name())?;
 
         let url = format!(
             "{API_BASE}/wenxinworkshop/chat/{}?access_token={access_token}",
-            &self.model.name,
+            &self.model.name(),
         );
 
         debug!("Ernie Request: {url} {body}");
@@ -77,8 +84,8 @@ impl Client for ErnieClient {
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        data: SendData,
-    ) -> Result<(String, CompletionDetails)> {
+        data: CompletionData,
+    ) -> Result<CompletionOutput> {
         self.prepare_access_token().await?;
         let builder = self.request_builder(client, data)?;
         send_message(builder).await
@@ -88,7 +95,7 @@ impl Client for ErnieClient {
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: SendData,
+        data: CompletionData,
     ) -> Result<()> {
         self.prepare_access_token().await?;
         let builder = self.request_builder(client, data)?;
@@ -96,15 +103,17 @@ impl Client for ErnieClient {
     }
 }
 
-async fn send_message(builder: RequestBuilder) -> Result<(String, CompletionDetails)> {
+async fn send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
     let data: Value = builder.send().await?.json().await?;
     maybe_catch_error(&data)?;
+    debug!("non-stream-data: {data}");
     extract_completion_text(&data)
 }
 
 async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandler) -> Result<()> {
-    let handle = |message: SsMmessage| -> Result<bool> {
+    let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
+        debug!("stream-data: {data}");
         if let Some(text) = data["result"].as_str() {
             handler.text(text)?;
         }
@@ -114,11 +123,12 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandle
     sse_stream(builder, handle).await
 }
 
-fn build_body(data: SendData, model: &Model) -> Value {
-    let SendData {
+fn build_body(data: CompletionData, model: &Model) -> Value {
+    let CompletionData {
         mut messages,
         temperature,
         top_p,
+        functions: _,
         stream,
     } = data;
 
@@ -145,16 +155,18 @@ fn build_body(data: SendData, model: &Model) -> Value {
     body
 }
 
-fn extract_completion_text(data: &Value) -> Result<(String, CompletionDetails)> {
+fn extract_completion_text(data: &Value) -> Result<CompletionOutput> {
     let text = data["result"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    let details = CompletionDetails {
+    let output = CompletionOutput {
+        text: text.to_string(),
+        tool_calls: vec![],
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["prompt_tokens"].as_u64(),
         output_tokens: data["usage"]["completion_tokens"].as_u64(),
     };
-    Ok((text.to_string(), details))
+    Ok(output)
 }
 
 async fn fetch_access_token(

@@ -1,9 +1,7 @@
-use std::time::Duration;
-
 use super::{
-    catch_error, generate_prompt, smart_prompt_format, sse_stream, Client, CompletionDetails,
-    ExtraConfig, Model, ModelConfig, PromptAction, PromptKind, ReplicateClient, SendData,
-    SsMmessage, SseHandler,
+    catch_error, prompt_format::*, sse_stream, Client, CompletionData, CompletionOutput,
+    ExtraConfig, Model, ModelData, ModelPatches, PromptAction, PromptKind, ReplicateClient,
+    SseHandler, SseMmessage,
 };
 
 use anyhow::{anyhow, Result};
@@ -11,6 +9,7 @@ use async_trait::async_trait;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 const API_BASE: &str = "https://api.replicate.com/v1";
 
@@ -19,7 +18,8 @@ pub struct ReplicateConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     #[serde(default)]
-    pub models: Vec<ModelConfig>,
+    pub models: Vec<ModelData>,
+    pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -32,12 +32,13 @@ impl ReplicateClient {
     fn request_builder(
         &self,
         client: &ReqwestClient,
-        data: SendData,
+        data: CompletionData,
         api_key: &str,
     ) -> Result<RequestBuilder> {
-        let body = build_body(data, &self.model)?;
+        let mut body = build_body(data, &self.model)?;
+        self.patch_request_body(&mut body);
 
-        let url = format!("{API_BASE}/models/{}/predictions", self.model.name);
+        let url = format!("{API_BASE}/models/{}/predictions", self.model.name());
 
         debug!("Replicate Request: {url} {body}");
 
@@ -54,8 +55,8 @@ impl Client for ReplicateClient {
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        data: SendData,
-    ) -> Result<(String, CompletionDetails)> {
+        data: CompletionData,
+    ) -> Result<CompletionOutput> {
         let api_key = self.get_api_key()?;
         let builder = self.request_builder(client, data, &api_key)?;
         send_message(client, builder, &api_key).await
@@ -65,7 +66,7 @@ impl Client for ReplicateClient {
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: SendData,
+        data: CompletionData,
     ) -> Result<()> {
         let api_key = self.get_api_key()?;
         let builder = self.request_builder(client, data, &api_key)?;
@@ -77,7 +78,7 @@ async fn send_message(
     client: &ReqwestClient,
     builder: RequestBuilder,
     api_key: &str,
-) -> Result<(String, CompletionDetails)> {
+) -> Result<CompletionOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -96,6 +97,7 @@ async fn send_message(
             .await?
             .json()
             .await?;
+        debug!("non-stream-data: {prediction_data}");
         let err = || anyhow!("Invalid response data: {prediction_data}");
         let status = prediction_data["status"].as_str().ok_or_else(err)?;
         if status == "succeeded" {
@@ -123,7 +125,7 @@ async fn send_message_streaming(
 
     let sse_builder = client.get(stream_url).header("accept", "text/event-stream");
 
-    let handle = |message: SsMmessage| -> Result<bool> {
+    let handle = |message: SseMmessage| -> Result<bool> {
         if message.event == "done" {
             return Ok(true);
         }
@@ -133,15 +135,16 @@ async fn send_message_streaming(
     sse_stream(sse_builder, handle).await
 }
 
-fn build_body(data: SendData, model: &Model) -> Result<Value> {
-    let SendData {
+fn build_body(data: CompletionData, model: &Model) -> Result<Value> {
+    let CompletionData {
         messages,
         temperature,
         top_p,
+        functions: _,
         stream,
     } = data;
 
-    let prompt = generate_prompt(&messages, smart_prompt_format(&model.name))?;
+    let prompt = generate_prompt(&messages, smart_prompt_format(model.name()))?;
 
     let mut input = json!({
         "prompt": prompt,
@@ -170,7 +173,7 @@ fn build_body(data: SendData, model: &Model) -> Result<Value> {
     Ok(body)
 }
 
-fn extract_completion(data: &Value) -> Result<(String, CompletionDetails)> {
+fn extract_completion(data: &Value) -> Result<CompletionOutput> {
     let text = data["output"]
         .as_array()
         .map(|parts| {
@@ -182,11 +185,13 @@ fn extract_completion(data: &Value) -> Result<(String, CompletionDetails)> {
         })
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
 
-    let details = CompletionDetails {
+    let output = CompletionOutput {
+        text: text.to_string(),
+        tool_calls: vec![],
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["metrics"]["input_token_count"].as_u64(),
         output_tokens: data["metrics"]["output_token_count"].as_u64(),
     };
 
-    Ok((text.to_string(), details))
+    Ok(output)
 }

@@ -2,16 +2,17 @@ use super::{openai::OpenAIConfig, BuiltinModels, ClientConfig, Message, Model, S
 
 use crate::{
     config::{GlobalConfig, Input},
+    function::{eval_tool_calls, FunctionDeclaration, ToolCall, ToolCallResult},
     render::{render_error, render_stream},
     utils::{prompt_input_integer, prompt_input_string, tokenize, AbortSignal, PromptKind},
 };
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use futures_util::{Stream, StreamExt};
+use fancy_regex::Regex;
+use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use reqwest::{Client as ReqwestClient, ClientBuilder, Proxy, RequestBuilder};
-use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{env, future::Future, time::Duration};
@@ -22,6 +23,7 @@ const MODELS_YAML: &str = include_str!("../../models.yaml");
 lazy_static! {
     pub static ref ALL_CLIENT_MODELS: Vec<BuiltinModels> =
         serde_yaml::from_str(MODELS_YAML).unwrap();
+    static ref ESCAPE_SLASH_RE: Regex = Regex::new(r"(?<!\\)/").unwrap();
 }
 
 #[macro_export]
@@ -52,7 +54,7 @@ macro_rules! register_client {
         pub enum ClientModel {
             $(
                 #[serde(rename = $name)]
-                $config { models: Vec<ModelConfig> },
+                $config { models: Vec<ModelData> },
             )+
             #[serde(other)]
             Unknown,
@@ -70,11 +72,10 @@ macro_rules! register_client {
             impl $client {
                 pub const NAME: &'static str = $name;
 
-                pub fn init(global_config: &$crate::config::GlobalConfig) -> Option<Box<dyn Client>> {
-                    let model = global_config.read().model.clone();
+                pub fn init(global_config: &$crate::config::GlobalConfig, model: &$crate::client::Model) -> Option<Box<dyn Client>> {
                     let config = global_config.read().clients.iter().find_map(|client_config| {
                         if let ClientConfig::$config(c) = client_config {
-                            if Self::name(c) == &model.client_name {
+                            if Self::name(c) == model.client_name() {
                                 return Some(c.clone())
                             }
                         }
@@ -84,7 +85,7 @@ macro_rules! register_client {
                     Some(Box::new(Self {
                         global_config: global_config.clone(),
                         config,
-                        model,
+                        model: model.clone(),
                     }))
                 }
 
@@ -109,26 +110,13 @@ macro_rules! register_client {
 
         )+
 
-        pub fn init_client(config: &$crate::config::GlobalConfig) -> anyhow::Result<Box<dyn Client>> {
+        pub fn init_client(config: &$crate::config::GlobalConfig, model: Option<$crate::client::Model>) -> anyhow::Result<Box<dyn Client>> {
+            let model = model.unwrap_or_else(|| config.read().model.clone());
             None
-            $(.or_else(|| $client::init(config)))+
+            $(.or_else(|| $client::init(config, &model)))+
             .ok_or_else(|| {
-                anyhow::anyhow!("Unknown client '{}'", &config.read().model.client_name)
+                anyhow::anyhow!("Unknown client '{}'", model.client_name())
             })
-        }
-
-        pub fn ensure_model_capabilities(client: &mut dyn Client, capabilities: $crate::client::ModelCapabilities) -> anyhow::Result<()> {
-            if !client.model().capabilities.contains(capabilities) {
-                let models = client.list_models();
-                if let Some(model) = models.into_iter().find(|v| v.capabilities.contains(capabilities)) {
-                    client.set_model(model);
-                } else {
-                    anyhow::bail!(
-                        "The current model is incapable of doing that."
-                    );
-                }
-            }
-            Ok(())
         }
 
         pub fn list_client_types() -> Vec<&'static str> {
@@ -171,13 +159,16 @@ macro_rules! register_client {
 #[macro_export]
 macro_rules! client_common_fns {
     () => {
-        fn config(
-            &self,
-        ) -> (
-            &$crate::config::GlobalConfig,
-            &Option<$crate::client::ExtraConfig>,
-        ) {
-            (&self.global_config, &self.config.extra)
+        fn global_config(&self) -> &$crate::config::GlobalConfig {
+            &self.global_config
+        }
+
+        fn extra_config(&self) -> Option<&$crate::client::ExtraConfig> {
+            self.config.extra.as_ref()
+        }
+
+        fn patches_config(&self) -> Option<&$crate::client::ModelPatches> {
+            self.config.patches.as_ref()
         }
 
         fn list_models(&self) -> Vec<Model> {
@@ -212,8 +203,8 @@ macro_rules! impl_client_trait {
             async fn send_message_inner(
                 &self,
                 client: &reqwest::Client,
-                data: $crate::client::SendData,
-            ) -> anyhow::Result<(String, $crate::client::CompletionDetails)> {
+                data: $crate::client::CompletionData,
+            ) -> anyhow::Result<$crate::client::CompletionOutput> {
                 let builder = self.request_builder(client, data)?;
                 $send_message(builder).await
             }
@@ -222,7 +213,7 @@ macro_rules! impl_client_trait {
                 &self,
                 client: &reqwest::Client,
                 handler: &mut $crate::client::SseHandler,
-                data: $crate::client::SendData,
+                data: $crate::client::CompletionData,
             ) -> Result<()> {
                 let builder = self.request_builder(client, data)?;
                 $send_message_streaming(builder, handler).await
@@ -259,26 +250,30 @@ macro_rules! unsupported_model {
 
 #[async_trait]
 pub trait Client: Sync + Send {
-    fn config(&self) -> (&GlobalConfig, &Option<ExtraConfig>);
+    fn global_config(&self) -> &GlobalConfig;
 
-    fn list_models(&self) -> Vec<Model>;
+    fn extra_config(&self) -> Option<&ExtraConfig>;
 
+    fn patches_config(&self) -> Option<&ModelPatches>;
+
+    #[allow(unused)]
     fn name(&self) -> &str;
+
+    #[allow(unused)]
+    fn list_models(&self) -> Vec<Model>;
 
     fn model(&self) -> &Model;
 
     fn model_mut(&mut self) -> &mut Model;
 
+    #[allow(unused)]
     fn set_model(&mut self, model: Model);
 
     fn build_client(&self) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
-        let options = self.config().1;
-        let timeout = options
-            .as_ref()
-            .and_then(|v| v.connect_timeout)
-            .unwrap_or(10);
-        let proxy = options.as_ref().and_then(|v| v.proxy.clone());
+        let extra = self.extra_config();
+        let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
+        let proxy = extra.and_then(|v| v.proxy.clone());
         builder = set_proxy(builder, &proxy)?;
         let client = builder
             .connect_timeout(Duration::from_secs(timeout))
@@ -287,14 +282,14 @@ pub trait Client: Sync + Send {
         Ok(client)
     }
 
-    async fn send_message(&self, input: Input) -> Result<(String, CompletionDetails)> {
-        let global_config = self.config().0;
-        if global_config.read().dry_run {
-            let content = global_config.read().echo_messages(&input);
-            return Ok((content, CompletionDetails::default()));
+    async fn send_message(&self, input: Input) -> Result<CompletionOutput> {
+        if self.global_config().read().dry_run {
+            let content = input.echo_messages();
+            return Ok(CompletionOutput::new(&content));
         }
         let client = self.build_client()?;
-        let data = global_config.read().prepare_send_data(&input, false)?;
+
+        let data = input.prepare_completion_data(self.model(), false)?;
         self.send_message_inner(&client, data)
             .await
             .with_context(|| "Failed to get answer")
@@ -313,18 +308,17 @@ pub trait Client: Sync + Send {
         let input = input.clone();
         tokio::select! {
             ret = async {
-                let global_config = self.config().0;
-                if global_config.read().dry_run {
-                    let content = global_config.read().echo_messages(&input);
+                if self.global_config().read().dry_run {
+                    let content = input.echo_messages();
                     let tokens = tokenize(&content);
                     for token in tokens {
                         tokio::time::sleep(Duration::from_millis(10)).await;
-                        handler.text(&token)?;
+                        handler.text(token)?;
                     }
                     return Ok(());
                 }
                 let client = self.build_client()?;
-                let data = global_config.read().prepare_send_data(&input, true)?;
+                let data = input.prepare_completion_data(self.model(), true)?;
                 self.send_message_streaming_inner(&client, handler, data).await
             } => {
                 handler.done()?;
@@ -337,17 +331,26 @@ pub trait Client: Sync + Send {
         }
     }
 
+    fn patch_request_body(&self, body: &mut Value) {
+        let model_name = self.model().name();
+        if let Some(patch_data) = select_model_patch(self.patches_config(), model_name) {
+            if body.is_object() && patch_data.request_body.is_object() {
+                json_patch::merge(body, &patch_data.request_body)
+            }
+        }
+    }
+
     async fn send_message_inner(
         &self,
         client: &ReqwestClient,
-        data: SendData,
-    ) -> Result<(String, CompletionDetails)>;
+        data: CompletionData,
+    ) -> Result<CompletionOutput>;
 
     async fn send_message_streaming_inner(
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: SendData,
+        data: CompletionData,
     ) -> Result<()>;
 }
 
@@ -363,19 +366,55 @@ pub struct ExtraConfig {
     pub connect_timeout: Option<u64>,
 }
 
+pub type ModelPatches = IndexMap<String, ModelPatch>;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelPatch {
+    #[serde(default)]
+    pub request_body: Value,
+}
+
+pub fn select_model_patch<'a>(
+    patch: Option<&'a ModelPatches>,
+    name: &str,
+) -> Option<&'a ModelPatch> {
+    let patch = patch?;
+    for (key, patch_data) in patch {
+        let key = ESCAPE_SLASH_RE.replace_all(key, r"\/");
+        if let Ok(regex) = Regex::new(&format!("^({key})$")) {
+            if let Ok(true) = regex.is_match(name) {
+                return Some(patch_data);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
-pub struct SendData {
+pub struct CompletionData {
     pub messages: Vec<Message>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CompletionDetails {
+pub struct CompletionOutput {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+
+impl CompletionOutput {
+    pub fn new(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 pub type PromptAction<'a> = (&'a str, &'a str, bool, PromptKind);
@@ -429,22 +468,24 @@ pub async fn send_stream(
     client: &dyn Client,
     config: &GlobalConfig,
     abort: AbortSignal,
-) -> Result<String> {
+) -> Result<(String, Vec<ToolCallResult>)> {
     let (tx, rx) = unbounded_channel();
-    let mut stream_handler = SseHandler::new(tx, abort.clone());
+    let mut handler = SseHandler::new(tx, abort.clone());
 
     let (send_ret, rend_ret) = tokio::join!(
-        client.send_message_streaming(input, &mut stream_handler),
+        client.send_message_streaming(input, &mut handler),
         render_stream(rx, config, abort.clone()),
     );
     if let Err(err) = rend_ret {
         render_error(err, config.read().highlight);
     }
-    let output = stream_handler.get_buffer().to_string();
+    let (output, calls) = handler.take();
     match send_ret {
         Ok(_) => {
-            println!();
-            Ok(output)
+            if !output.is_empty() && !output.ends_with('\n') {
+                println!();
+            }
+            Ok((output, eval_tool_calls(config, calls)?))
         }
         Err(err) => {
             if !output.is_empty() {
@@ -478,16 +519,24 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     }
     debug!("Invalid response, status: {status}, data: {data}");
     if let Some(error) = data["error"].as_object() {
-        if let (Some(typ), Some(message)) = (error["type"].as_str(), error["message"].as_str()) {
+        if let (Some(typ), Some(message)) = (
+            get_str_field_from_json_map(error, "type"),
+            get_str_field_from_json_map(error, "message"),
+        ) {
             bail!("{message} (type: {typ})");
         }
     } else if let Some(error) = data["errors"][0].as_object() {
-        if let (Some(code), Some(message)) = (error["code"].as_u64(), error["message"].as_str()) {
+        if let (Some(code), Some(message)) = (
+            get_u64_field_from_json_map(error, "code"),
+            get_str_field_from_json_map(error, "message"),
+        ) {
             bail!("{message} (status: {code})")
         }
     } else if let Some(error) = data[0]["error"].as_object() {
-        if let (Some(status), Some(message)) = (error["status"].as_str(), error["message"].as_str())
-        {
+        if let (Some(status), Some(message)) = (
+            get_str_field_from_json_map(error, "status"),
+            get_str_field_from_json_map(error, "message"),
+        ) {
             bail!("{message} (status: {status})")
         }
     } else if let (Some(detail), Some(status)) = (data["detail"].as_str(), data["status"].as_i64())
@@ -501,6 +550,20 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     bail!("Invalid response data: {data} (status: {status})");
 }
 
+pub fn get_str_field_from_json_map<'a>(
+    map: &'a serde_json::Map<String, Value>,
+    field_name: &str,
+) -> Option<&'a str> {
+    map.get(field_name).and_then(|v| v.as_str())
+}
+
+pub fn get_u64_field_from_json_map(
+    map: &serde_json::Map<String, Value>,
+    field_name: &str,
+) -> Option<u64> {
+    map.get(field_name).and_then(|v| v.as_u64())
+}
+
 pub fn maybe_catch_error(data: &Value) -> Result<()> {
     if let (Some(code), Some(message)) = (data["code"].as_str(), data["message"].as_str()) {
         debug!("Invalid response: {}", data);
@@ -510,125 +573,6 @@ pub fn maybe_catch_error(data: &Value) -> Result<()> {
     {
         debug!("Invalid response: {}", data);
         bail!("{error_msg} (error_code: {error_code})");
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-pub struct SsMmessage {
-    pub event: String,
-    pub data: String,
-}
-
-pub async fn sse_stream<F>(builder: RequestBuilder, mut handle: F) -> Result<()>
-where
-    F: FnMut(SsMmessage) -> Result<bool>,
-{
-    let mut es = builder.eventsource()?;
-    while let Some(event) = es.next().await {
-        match event {
-            Ok(Event::Open) => {}
-            Ok(Event::Message(message)) => {
-                let message = SsMmessage {
-                    event: message.event,
-                    data: message.data,
-                };
-                if handle(message)? {
-                    break;
-                }
-            }
-            Err(err) => {
-                match err {
-                    EventSourceError::StreamEnded => {}
-                    EventSourceError::InvalidStatusCode(status, res) => {
-                        let text = res.text().await?;
-                        let data: Value = match text.parse() {
-                            Ok(data) => data,
-                            Err(_) => {
-                                bail!(
-                                    "Invalid response data: {text} (status: {})",
-                                    status.as_u16()
-                                );
-                            }
-                        };
-                        catch_error(&data, status.as_u16())?;
-                    }
-                    EventSourceError::InvalidContentType(header_value, res) => {
-                        let text = res.text().await?;
-                        bail!(
-                            "Invalid response event-stream. content-type: {}, data: {text}",
-                            header_value.to_str().unwrap_or_default()
-                        );
-                    }
-                    _ => {
-                        bail!("{}", err);
-                    }
-                }
-                es.close();
-            }
-        }
-    }
-    Ok(())
-}
-
-pub async fn json_stream<S, F>(mut stream: S, mut handle: F) -> Result<()>
-where
-    S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-    F: FnMut(&str) -> Result<()>,
-{
-    let mut buffer = vec![];
-    let mut cursor = 0;
-    let mut start = 0;
-    let mut balances = vec![];
-    let mut quoting = false;
-    let mut escape = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let chunk = std::str::from_utf8(&chunk)?;
-        buffer.extend(chunk.chars());
-        for i in cursor..buffer.len() {
-            let ch = buffer[i];
-            if quoting {
-                if ch == '\\' {
-                    escape = !escape;
-                } else {
-                    if !escape && ch == '"' {
-                        quoting = false;
-                    }
-                    escape = false;
-                }
-                continue;
-            }
-            match ch {
-                '"' => {
-                    quoting = true;
-                    escape = false;
-                }
-                '{' => {
-                    if balances.is_empty() {
-                        start = i;
-                    }
-                    balances.push(ch);
-                }
-                '[' => {
-                    if start != 0 {
-                        balances.push(ch);
-                    }
-                }
-                '}' => {
-                    balances.pop();
-                    if balances.is_empty() {
-                        let value: String = buffer[start..=i].iter().collect();
-                        handle(&value)?;
-                    }
-                }
-                ']' => {
-                    balances.pop();
-                }
-                _ => {}
-            }
-        }
-        cursor = buffer.len();
     }
     Ok(())
 }
