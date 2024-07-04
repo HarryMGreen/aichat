@@ -1,9 +1,6 @@
-use super::{
-    catch_error, json_stream, message::*, Client, CompletionData, CompletionOutput, ExtraConfig,
-    Model, ModelData, ModelPatches, OllamaClient, PromptAction, PromptKind, SseHandler,
-};
+use super::*;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,7 +10,7 @@ pub struct OllamaConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_auth: Option<String>,
-    pub chat_endpoint: Option<String>,
+    #[serde(default)]
     pub models: Vec<ModelData>,
     pub patches: Option<ModelPatches>,
     pub extra: Option<ExtraConfig>,
@@ -35,22 +32,45 @@ impl OllamaClient {
         ),
     ];
 
-    fn request_builder(
+    fn chat_completions_builder(
         &self,
         client: &ReqwestClient,
-        data: CompletionData,
+        data: ChatCompletionsData,
     ) -> Result<RequestBuilder> {
         let api_base = self.get_api_base()?;
         let api_auth = self.get_api_auth().ok();
 
-        let mut body = build_body(data, &self.model)?;
-        self.patch_request_body(&mut body);
+        let mut body = build_chat_completions_body(data, &self.model)?;
+        self.patch_chat_completions_body(&mut body);
 
-        let chat_endpoint = self.config.chat_endpoint.as_deref().unwrap_or("/api/chat");
+        let url = format!("{api_base}/api/chat");
 
-        let url = format!("{api_base}{chat_endpoint}");
+        debug!("Ollama Chat Completions Request: {url} {body}");
 
-        debug!("Ollama Request: {url} {body}");
+        let mut builder = client.post(url).json(&body);
+        if let Some(api_auth) = api_auth {
+            builder = builder.header("Authorization", api_auth)
+        }
+
+        Ok(builder)
+    }
+
+    fn embeddings_builder(
+        &self,
+        client: &ReqwestClient,
+        data: EmbeddingsData,
+    ) -> Result<RequestBuilder> {
+        let api_base = self.get_api_base()?;
+        let api_auth = self.get_api_auth().ok();
+
+        let body = json!({
+            "model": self.model.name(),
+            "prompt": data.texts[0],
+        });
+
+        let url = format!("{api_base}/api/embeddings");
+
+        debug!("Ollama Embeddings Request: {url} {body}");
 
         let mut builder = client.post(url).json(&body);
         if let Some(api_auth) = api_auth {
@@ -61,9 +81,14 @@ impl OllamaClient {
     }
 }
 
-impl_client_trait!(OllamaClient, send_message, send_message_streaming);
+impl_client_trait!(
+    OllamaClient,
+    chat_completions,
+    chat_completions_streaming,
+    embeddings
+);
 
-async fn send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
+async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data = res.json().await?;
@@ -74,10 +99,13 @@ async fn send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
     let text = data["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    Ok(CompletionOutput::new(text))
+    Ok(ChatCompletionsOutput::new(text))
 }
 
-async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandler) -> Result<()> {
+async fn chat_completions_streaming(
+    builder: RequestBuilder,
+    handler: &mut SseHandler,
+) -> Result<()> {
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
@@ -105,8 +133,26 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut SseHandle
     Ok(())
 }
 
-fn build_body(data: CompletionData, model: &Model) -> Result<Value> {
-    let CompletionData {
+async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+    let res_body: EmbeddingsResBody =
+        serde_json::from_value(data).context("Invalid embeddings data")?;
+    let output = vec![res_body.embedding];
+    Ok(output)
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBody {
+    embedding: Vec<f32>,
+}
+
+fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Result<Value> {
+    let ChatCompletionsData {
         messages,
         temperature,
         top_p,

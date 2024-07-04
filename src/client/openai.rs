@@ -1,10 +1,6 @@
-use super::{
-    catch_error, message::*, sse_stream, Client, CompletionData, CompletionOutput, ExtraConfig,
-    Model, ModelData, ModelPatches, OpenAIClient, PromptAction, PromptKind, SseHandler,
-    SseMmessage, ToolCall,
-};
+use super::*;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,20 +26,20 @@ impl OpenAIClient {
     pub const PROMPTS: [PromptAction<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
 
-    fn request_builder(
+    fn chat_completions_builder(
         &self,
         client: &ReqwestClient,
-        data: CompletionData,
+        data: ChatCompletionsData,
     ) -> Result<RequestBuilder> {
         let api_key = self.get_api_key()?;
         let api_base = self.get_api_base().unwrap_or_else(|_| API_BASE.to_string());
 
-        let mut body = openai_build_body(data, &self.model);
-        self.patch_request_body(&mut body);
+        let mut body = openai_build_chat_completions_body(data, &self.model);
+        self.patch_chat_completions_body(&mut body);
 
         let url = format!("{api_base}/chat/completions");
 
-        debug!("OpenAI Request: {url} {body}");
+        debug!("OpenAI Chat Completions Request: {url} {body}");
 
         let mut builder = client.post(url).bearer_auth(api_key).json(&body);
 
@@ -53,9 +49,28 @@ impl OpenAIClient {
 
         Ok(builder)
     }
+
+    fn embeddings_builder(
+        &self,
+        client: &ReqwestClient,
+        data: EmbeddingsData,
+    ) -> Result<RequestBuilder> {
+        let api_key = self.get_api_key()?;
+        let api_base = self.get_api_base().unwrap_or_else(|_| API_BASE.to_string());
+
+        let body = openai_build_embeddings_body(data, &self.model);
+
+        let url = format!("{api_base}/embeddings");
+
+        debug!("OpenAI Embeddings Request: {url} {body}");
+
+        let builder = client.post(url).bearer_auth(api_key).json(&body);
+
+        Ok(builder)
+    }
 }
 
-pub async fn openai_send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
+pub async fn openai_chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -64,10 +79,10 @@ pub async fn openai_send_message(builder: RequestBuilder) -> Result<CompletionOu
     }
 
     debug!("non-stream-data: {data}");
-    openai_extract_completion(&data)
+    openai_extract_chat_completions(&data)
 }
 
-pub async fn openai_send_message_streaming(
+pub async fn openai_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
 ) -> Result<()> {
@@ -125,8 +140,31 @@ pub async fn openai_send_message_streaming(
     sse_stream(builder, handle).await
 }
 
-pub fn openai_build_body(data: CompletionData, model: &Model) -> Value {
-    let CompletionData {
+pub async fn openai_embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+    let res_body: EmbeddingsResBody =
+        serde_json::from_value(data).context("Invalid embeddings data")?;
+    let output = res_body.data.into_iter().map(|v| v.embedding).collect();
+    Ok(output)
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBody {
+    data: Vec<EmbeddingsResBodyEmbedding>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBodyEmbedding {
+    embedding: Vec<f32>,
+}
+
+pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Value {
+    let ChatCompletionsData {
         messages,
         temperature,
         top_p,
@@ -139,26 +177,26 @@ pub fn openai_build_body(data: CompletionData, model: &Model) -> Value {
         .flat_map(|message| {
             let Message { role, content } = message;
             match content {
-                MessageContent::ToolResults((tool_call_results, text)) => {
-                    let tool_calls: Vec<_> = tool_call_results.iter().map(|tool_call_result| {
+                MessageContent::ToolResults((tool_results, text)) => {
+                    let tool_calls: Vec<_> = tool_results.iter().map(|tool_result| {
                         json!({
-                            "id": tool_call_result.call.id,
+                            "id": tool_result.call.id,
                             "type": "function",
                             "function": {
-                                "name": tool_call_result.call.name,
-                                "arguments": tool_call_result.call.arguments,
+                                "name": tool_result.call.name,
+                                "arguments": tool_result.call.arguments,
                             },
                         })
                     }).collect();
                     let mut messages = vec![
                         json!({ "role": MessageRole::Assistant, "content": text, "tool_calls": tool_calls })
                     ];
-                    for tool_call_result in tool_call_results {
+                    for tool_result in tool_results {
                         messages.push(
                             json!({
                                 "role": "tool",
-                                "content": tool_call_result.output.to_string(),
-                                "tool_call_id": tool_call_result.call.id,
+                                "content": tool_result.output.to_string(),
+                                "tool_call_id": tool_result.call.id,
                             })
                         );
                     }
@@ -196,19 +234,25 @@ pub fn openai_build_body(data: CompletionData, model: &Model) -> Value {
                 })
             })
             .collect();
-        body["tool_choice"] = "auto".into();
     }
     body
 }
 
-pub fn openai_extract_completion(data: &Value) -> Result<CompletionOutput> {
+pub fn openai_build_embeddings_body(data: EmbeddingsData, model: &Model) -> Value {
+    json!({
+        "input": data.texts,
+        "model": model.name()
+    })
+}
+
+pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let text = data["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default();
 
     let mut tool_calls = vec![];
-    if let Some(tools_call) = data["choices"][0]["message"]["tool_calls"].as_array() {
-        tool_calls = tools_call
+    if let Some(calls) = data["choices"][0]["message"]["tool_calls"].as_array() {
+        tool_calls = calls
             .iter()
             .filter_map(|call| {
                 if let (Some(name), Some(arguments), Some(id)) = (
@@ -231,7 +275,7 @@ pub fn openai_extract_completion(data: &Value) -> Result<CompletionOutput> {
     if text.is_empty() && tool_calls.is_empty() {
         bail!("Invalid response data: {data}");
     }
-    let output = CompletionOutput {
+    let output = ChatCompletionsOutput {
         text: text.to_string(),
         tool_calls,
         id: data["id"].as_str().map(|v| v.to_string()),
@@ -243,6 +287,7 @@ pub fn openai_extract_completion(data: &Value) -> Result<CompletionOutput> {
 
 impl_client_trait!(
     OpenAIClient,
-    openai_send_message,
-    openai_send_message_streaming
+    openai_chat_completions,
+    openai_chat_completions_streaming,
+    openai_embeddings
 );

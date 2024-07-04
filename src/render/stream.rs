@@ -1,6 +1,6 @@
 use super::{MarkdownRender, SseEvent};
 
-use crate::utils::{run_spinner, AbortSignal};
+use crate::utils::{create_spinner, AbortSignal};
 
 use anyhow::Result;
 use crossterm::{
@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use textwrap::core::display_width;
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub async fn markdown_stream(
     rx: UnboundedReceiver<SseEvent>,
@@ -62,17 +62,15 @@ async fn markdown_stream_inner(
 
     let columns = terminal::size()?.0;
 
-    let (spinner_tx, spinner_rx) = oneshot::channel();
-    let mut spinner_tx = Some(spinner_tx);
-    tokio::spawn(run_spinner(" Generating", spinner_rx));
+    let mut spinner = Some(create_spinner("Generating").await);
 
     'outer: loop {
         if abort.aborted() {
             return Ok(());
         }
         for reply_event in gather_events(&mut rx).await {
-            if let Some(spinner_tx) = spinner_tx.take() {
-                let _ = spinner_tx.send(());
+            if let Some(spinner) = spinner.take() {
+                spinner.stop();
             }
 
             match reply_event {
@@ -150,8 +148,8 @@ async fn markdown_stream_inner(
         }
     }
 
-    if let Some(spinner_tx) = spinner_tx.take() {
-        let _ = spinner_tx.send(());
+    if let Some(spinner) = spinner.take() {
+        spinner.stop();
     }
     Ok(())
 }

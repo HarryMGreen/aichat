@@ -53,3 +53,12 @@ impl AbortSignalInner {
         self.ctrld.store(true, Ordering::SeqCst);
     }
 }
+
+pub async fn watch_abort_signal(abort_signal: AbortSignal) {
+    loop {
+        if abort_signal.aborted() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}

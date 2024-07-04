@@ -1,11 +1,4 @@
-use crate::{
-    client::{
-        init_client, list_models, ClientConfig, CompletionData, CompletionOutput, Message, Model,
-        ModelData, SseEvent, SseHandler,
-    },
-    config::{Config, GlobalConfig, Role},
-    utils::create_abort_signal,
-};
+use crate::{client::*, config::*, utils::*};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -56,8 +49,9 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     let stop_server = server.run(listener).await?;
     println!("Chat Completions API: http://{addr}/v1/chat/completions");
+    println!("Embeddings API:       http://{addr}/v1/embeddings");
     println!("LLM Playground:       http://{addr}/playground");
-    println!("LLM Arena:            http://{addr}/arena");
+    println!("LLM Arena:            http://{addr}/arena?num=2");
     shutdown_signal().await;
     let _ = stop_server.send(());
     Ok(())
@@ -89,26 +83,14 @@ impl Server {
                 } else {
                     model.id()
                 };
-                let ModelData {
-                    max_input_tokens,
-                    max_output_tokens,
-                    pass_max_tokens,
-                    input_price,
-                    output_price,
-                    supports_vision,
-                    supports_function_calling,
-                    ..
-                } = model.data();
-                json!({
-                    "id": id,
-                    "max_input_tokens": max_input_tokens,
-                    "max_output_tokens": max_output_tokens,
-                    "pass_max_tokens": pass_max_tokens,
-                    "input_price": input_price,
-                    "output_price": output_price,
-                    "supports_vision": supports_vision,
-                    "supports_function_calling": supports_function_calling,
-                })
+                let mut value = json!(model.data());
+                if let Some(value_obj) = value.as_object_mut() {
+                    value_obj.insert("id".into(), id.into());
+                    value_obj.insert("object".into(), "model".into());
+                    value_obj.insert("owned_by".into(), model.client_name().into());
+                    value_obj.remove("name");
+                }
+                value
             })
             .collect();
         Self {
@@ -168,7 +150,9 @@ impl Server {
 
         let mut status = StatusCode::OK;
         let res = if path == "/v1/chat/completions" {
-            self.chat_completion(req).await
+            self.chat_completions(req).await
+        } else if path == "/v1/embeddings" {
+            self.embeddings(req).await
         } else if path == "/v1/models" {
             self.list_models()
         } else if path == "/v1/roles" {
@@ -227,12 +211,16 @@ impl Server {
         Ok(res)
     }
 
-    async fn chat_completion(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
+    async fn chat_completions(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let req_body = req.collect().await?.to_bytes();
-        let req_body: ChatCompletionReqBody = serde_json::from_slice(&req_body)
+        let req_body: Value = serde_json::from_slice(&req_body)
+            .map_err(|err| anyhow!("Invalid request json, {err}"))?;
+
+        debug!("chat completions request: {req_body}");
+        let req_body = serde_json::from_value(req_body)
             .map_err(|err| anyhow!("Invalid request body, {err}"))?;
 
-        let ChatCompletionReqBody {
+        let ChatCompletionsReqBody {
             model,
             messages,
             temperature,
@@ -270,7 +258,7 @@ impl Server {
         let completion_id = generate_completion_id();
         let created = Utc::now().timestamp();
 
-        let completion_data: CompletionData = CompletionData {
+        let data: ChatCompletionsData = ChatCompletionsData {
             messages,
             temperature,
             top_p,
@@ -306,7 +294,7 @@ impl Server {
                 }
                 tokio::select! {
                     _ = map_event(rx2, &tx, &mut is_first) => {}
-                    ret = client.send_message_streaming_inner(&http_client, &mut handler, completion_data) => {
+                    ret = client.chat_completions_streaming_inner(&http_client, &mut handler, data) => {
                         if let Err(err) = ret {
                             send_first_event(&tx, Some(format!("{err:?}")), &mut is_first)
                         }
@@ -350,9 +338,7 @@ impl Server {
                 .body(BodyExt::boxed(StreamBody::new(stream)))?;
             Ok(res)
         } else {
-            let output = client
-                .send_message_inner(&http_client, completion_data)
-                .await?;
+            let output = client.chat_completions_inner(&http_client, data).await?;
             let res = Response::builder()
                 .header("Content-Type", "application/json")
                 .body(
@@ -367,10 +353,68 @@ impl Server {
             Ok(res)
         }
     }
+
+    async fn embeddings(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
+        let req_body = req.collect().await?.to_bytes();
+        let req_body: Value = serde_json::from_slice(&req_body)
+            .map_err(|err| anyhow!("Invalid request json, {err}"))?;
+
+        debug!("embeddings request: {req_body}");
+        let req_body = serde_json::from_value(req_body)
+            .map_err(|err| anyhow!("Invalid request body, {err}"))?;
+
+        let EmbeddingsReqBody {
+            input,
+            model: embedding_model_id,
+        } = req_body;
+
+        let config = Config {
+            clients: self.clients.to_vec(),
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+        let embedding_model = Model::retrieve_embedding(&config.read(), &embedding_model_id)?;
+
+        let texts = match input {
+            EmbeddingsReqBodyInput::Single(v) => vec![v],
+            EmbeddingsReqBodyInput::Multiple(v) => v,
+        };
+        let client = init_client(&config, Some(embedding_model))?;
+        let data = client
+            .embeddings(EmbeddingsData {
+                query: false,
+                texts,
+            })
+            .await?;
+        let data: Vec<_> = data
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                json!({
+                        "object": "embedding",
+                        "embedding": v,
+                        "index": i,
+                })
+            })
+            .collect();
+        let output = json!({
+            "object": "list",
+            "data": data,
+            "model": embedding_model_id,
+            "usage": {
+                "prompt_tokens": 0,
+                "total_tokens": 0,
+            }
+        });
+        let res = Response::builder()
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(output.to_string())).boxed())?;
+        Ok(res)
+    }
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionReqBody {
+struct ChatCompletionsReqBody {
     model: String,
     messages: Vec<Message>,
     temperature: Option<f64>,
@@ -378,6 +422,19 @@ struct ChatCompletionReqBody {
     max_tokens: Option<isize>,
     #[serde(default)]
     stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsReqBody {
+    pub input: EmbeddingsReqBodyInput,
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EmbeddingsReqBodyInput {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -452,7 +509,7 @@ fn create_frame(id: &str, model: &str, created: i64, content: &str, done: bool) 
     Frame::data(Bytes::from(output))
 }
 
-fn ret_non_stream(id: &str, model: &str, created: i64, output: &CompletionOutput) -> Bytes {
+fn ret_non_stream(id: &str, model: &str, created: i64, output: &ChatCompletionsOutput) -> Bytes {
     let id = output.id.as_deref().unwrap_or(id);
     let input_tokens = output.input_tokens.unwrap_or_default();
     let output_tokens = output.output_tokens.unwrap_or_default();

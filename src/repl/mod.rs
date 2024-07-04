@@ -6,11 +6,11 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::send_stream;
-use crate::config::{GlobalConfig, Input, InputContext, State};
-use crate::function::need_send_call_results;
+use crate::client::chat_completion_streaming;
+use crate::config::{AssertState, Config, GlobalConfig, Input, StateFlags};
+use crate::function::need_send_tool_results;
 use crate::render::render_error;
-use crate::utils::{create_abort_signal, set_text, AbortSignal};
+use crate::utils::{create_abort_signal, set_text, temp_file, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use async_recursion::async_recursion;
@@ -33,43 +33,110 @@ lazy_static! {
 const MENU_NAME: &str = "completion_menu";
 
 lazy_static! {
-    static ref REPL_COMMANDS: [ReplCommand; 16] = [
-        ReplCommand::new(".help", "Show this help message", State::all()),
-        ReplCommand::new(".info", "View system info", State::all()),
-        ReplCommand::new(".model", "Change the current LLM", State::all()),
+    static ref REPL_COMMANDS: [ReplCommand; 27] = [
+        ReplCommand::new(".help", "Show this help message", AssertState::pass()),
+        ReplCommand::new(".info", "View system info", AssertState::pass()),
+        ReplCommand::new(".model", "Change the current LLM", AssertState::pass()),
         ReplCommand::new(
             ".prompt",
             "Create a temporary role using a prompt",
-            State::able_change_role()
+            AssertState::False(StateFlags::SESSION | StateFlags::AGENT)
         ),
         ReplCommand::new(
             ".role",
             "Switch to a specific role",
-            State::able_change_role()
+            AssertState::False(StateFlags::SESSION | StateFlags::AGENT)
         ),
-        ReplCommand::new(".info role", "View role info", State::in_role(),),
-        ReplCommand::new(".exit role", "Leave the role", State::in_role(),),
-        ReplCommand::new(".session", "Begin a chat session", State::not_in_session(),),
-        ReplCommand::new(".info session", "View session info", State::in_session(),),
+        ReplCommand::new(
+            ".info role",
+            "View role info",
+            AssertState::True(StateFlags::ROLE),
+        ),
+        ReplCommand::new(
+            ".exit role",
+            "Leave the role",
+            AssertState::True(StateFlags::ROLE),
+        ),
+        ReplCommand::new(
+            ".session",
+            "Begin a session",
+            AssertState::False(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
+        ),
+        ReplCommand::new(
+            ".info session",
+            "View session info",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
+        ),
         ReplCommand::new(
             ".save session",
-            "Save the chat to file",
-            State::in_session(),
+            "Save the current session to file",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION)
+        ),
+        ReplCommand::new(
+            ".edit session",
+            "Edit the current session with an editor",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION)
         ),
         ReplCommand::new(
             ".clear messages",
             "Erase messages in the current session",
-            State::unable_change_role()
+            AssertState::True(StateFlags::SESSION)
         ),
         ReplCommand::new(
             ".exit session",
-            "End the current session",
-            State::in_session(),
+            "End the session",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION)
         ),
-        ReplCommand::new(".file", "Include files with the message", State::all()),
-        ReplCommand::new(".set", "Adjust settings", State::all()),
-        ReplCommand::new(".copy", "Copy the last response", State::all()),
-        ReplCommand::new(".exit", "Exit the REPL", State::all()),
+        ReplCommand::new(
+            ".rag",
+            "Init or use the RAG",
+            AssertState::False(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".info rag",
+            "View RAG info",
+            AssertState::True(StateFlags::RAG),
+        ),
+        ReplCommand::new(
+            ".rebuild rag",
+            "Rebuild the RAG to sync document changes",
+            AssertState::True(StateFlags::RAG),
+        ),
+        ReplCommand::new(
+            ".exit rag",
+            "Leave the RAG",
+            AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
+        ),
+        ReplCommand::new(".agent", "Use a agent", AssertState::bare()),
+        ReplCommand::new(
+            ".info agent",
+            "View agent info",
+            AssertState::True(StateFlags::AGENT),
+        ),
+        ReplCommand::new(
+            ".starter",
+            "Use the conversation starter",
+            AssertState::True(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".exit agent",
+            "Leave the agent",
+            AssertState::True(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".file",
+            "Include files with the message",
+            AssertState::pass()
+        ),
+        ReplCommand::new(".continue", "Continue the response", AssertState::pass()),
+        ReplCommand::new(
+            ".regenerate",
+            "Regenerate the last response",
+            AssertState::pass()
+        ),
+        ReplCommand::new(".set", "Adjust settings", AssertState::pass()),
+        ReplCommand::new(".copy", "Copy the last response", AssertState::pass()),
+        ReplCommand::new(".exit", "Exit the REPL", AssertState::pass()),
     ];
     static ref COMMAND_RE: Regex = Regex::new(r"^\s*(\.\S*)\s*").unwrap();
     static ref MULTILINE_RE: Regex = Regex::new(r"(?s)^\s*:::\s*(.*)\s*:::\s*$").unwrap();
@@ -79,7 +146,7 @@ pub struct Repl {
     config: GlobalConfig,
     editor: Reedline,
     prompt: ReplPrompt,
-    abort: AbortSignal,
+    abort_signal: AbortSignal,
 }
 
 impl Repl {
@@ -87,14 +154,13 @@ impl Repl {
         let editor = Self::create_editor(config)?;
 
         let prompt = ReplPrompt::new(config);
-
-        let abort = create_abort_signal();
+        let abort_signal = create_abort_signal();
 
         Ok(Self {
             config: config.clone(),
             editor,
             prompt,
-            abort,
+            abort_signal,
         })
     }
 
@@ -102,13 +168,13 @@ impl Repl {
         self.banner();
 
         loop {
-            if self.abort.aborted_ctrld() {
+            if self.abort_signal.aborted_ctrld() {
                 break;
             }
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {
-                    self.abort.reset();
+                    self.abort_signal.reset();
                     match self.handle(&line).await {
                         Ok(exit) => {
                             if exit {
@@ -122,11 +188,11 @@ impl Repl {
                     }
                 }
                 Ok(Signal::CtrlC) => {
-                    self.abort.set_ctrlc();
+                    self.abort_signal.set_ctrlc();
                     println!("(To exit, press Ctrl+D or enter \".exit\")\n");
                 }
                 Ok(Signal::CtrlD) => {
-                    self.abort.set_ctrld();
+                    self.abort_signal.set_ctrld();
                     break;
                 }
                 _ => {}
@@ -156,24 +222,29 @@ impl Repl {
                         let info = self.config.read().session_info()?;
                         println!("{}", info);
                     }
+                    Some("rag") => {
+                        let info = self.config.read().rag_info()?;
+                        println!("{}", info);
+                    }
+                    Some("agent") => {
+                        let info = self.config.read().agent_info()?;
+                        println!("{}", info);
+                    }
                     Some(_) => unknown_command()?,
                     None => {
-                        let output = self.config.read().system_info()?;
+                        let output = self.config.read().sysinfo()?;
                         println!("{}", output);
                     }
                 },
                 ".model" => match args {
                     Some(name) => {
                         self.config.write().set_model(name)?;
-                        if self.config.read().state().is_normal() {
-                            self.config.write().set_model_id();
-                        }
                     }
                     None => println!("Usage: .model <name>"),
                 },
                 ".prompt" => match args {
                     Some(text) => {
-                        self.config.write().set_prompt(text)?;
+                        self.config.write().use_prompt(text)?;
                     }
                     None => println!("Usage: .prompt <text>..."),
                 },
@@ -181,26 +252,51 @@ impl Repl {
                     Some(args) => match args.split_once(|c| c == '\n' || c == ' ') {
                         Some((name, text)) => {
                             let role = self.config.read().retrieve_role(name.trim())?;
-                            let input = Input::from_str(
-                                &self.config,
-                                text.trim(),
-                                Some(InputContext::role(role)),
-                            );
-                            ask(&self.config, self.abort.clone(), input).await?;
+                            let input = Input::from_str(&self.config, text.trim(), Some(role));
+                            ask(&self.config, self.abort_signal.clone(), input, false).await?;
                         }
                         None => {
-                            self.config.write().set_role(args)?;
+                            self.config.write().use_role(args)?;
                         }
                     },
                     None => println!(r#"Usage: .role <name> [text]..."#),
                 },
                 ".session" => {
-                    self.config.write().start_session(args)?;
+                    self.config.write().use_session(args)?;
                 }
+                ".rag" => {
+                    Config::use_rag(&self.config, args, self.abort_signal.clone()).await?;
+                }
+                ".agent" => match args {
+                    Some(name) => {
+                        Config::use_agent(&self.config, name, None, self.abort_signal.clone())
+                            .await?;
+                    }
+                    None => println!(r#"Usage: .agent <name>"#),
+                },
+                ".starter" => match args {
+                    Some(value) => {
+                        let input = Input::from_str(&self.config, value, None);
+                        ask(&self.config, self.abort_signal.clone(), input, true).await?;
+                    }
+                    None => {
+                        let banner = self.config.read().agent_banner()?;
+                        let output = format!(
+                            r#"Usage: .starter <text>...
+
+Tips: use <tab> to autocomplete conversation starter text.
+---------------------------------------------------------
+
+{banner}"#
+                        );
+
+                        println!("{output}");
+                    }
+                },
                 ".save" => {
                     match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, args.trim()),
-                        None => (v, ""),
+                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
+                        None => (v, None),
                     }) {
                         Some(("session", name)) => {
                             self.config.write().save_session(name)?;
@@ -209,6 +305,57 @@ impl Repl {
                             println!(r#"Usage: .save session [name]"#)
                         }
                     }
+                }
+                ".edit" => {
+                    match args.map(|v| match v.split_once(' ') {
+                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
+                        None => (v, None),
+                    }) {
+                        Some(("session", _)) => {
+                            self.config.write().edit_session()?;
+                        }
+                        _ => {
+                            println!(r#"Usage: .edit session"#)
+                        }
+                    }
+                }
+                ".rebuild" => {
+                    match args.map(|v| match v.split_once(' ') {
+                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
+                        None => (v, None),
+                    }) {
+                        Some(("rag", _)) => {
+                            Config::rebuild_rag(&self.config, self.abort_signal.clone()).await?;
+                        }
+                        _ => {
+                            println!(r#"Usage: .rebuild rag"#)
+                        }
+                    }
+                }
+                ".file" => match args {
+                    Some(args) => {
+                        let (files, text) = split_files_text(args);
+                        let files = shell_words::split(files).with_context(|| "Invalid args")?;
+                        let input = Input::from_files(&self.config, text, files, None).await?;
+                        ask(&self.config, self.abort_signal.clone(), input, true).await?;
+                    }
+                    None => println!("Usage: .file <files>... [-- <text>...]"),
+                },
+                ".continue" => {
+                    let (mut input, output) = match self.config.read().last_message.clone() {
+                        Some(v) => v,
+                        None => bail!("Unable to continue response"),
+                    };
+                    input.set_continue_output(&output);
+                    ask(&self.config, self.abort_signal.clone(), input, true).await?;
+                }
+                ".regenerate" => {
+                    let (mut input, _) = match self.config.read().last_message.clone() {
+                        Some(v) => v,
+                        None => bail!("Unable to regenerate the last response"),
+                    };
+                    input.set_regenerate();
+                    ask(&self.config, self.abort_signal.clone(), input, true).await?;
                 }
                 ".set" => match args {
                     Some(args) => {
@@ -221,23 +368,20 @@ impl Repl {
                 ".copy" => {
                     let config = self.config.read();
                     self.copy(config.last_reply())
-                        .with_context(|| "Failed to copy the last output")?;
+                        .with_context(|| "Failed to copy the last response")?;
                 }
-                ".file" => match args {
-                    Some(args) => {
-                        let (files, text) = split_files_text(args);
-                        let files = shell_words::split(files).with_context(|| "Invalid args")?;
-                        let input = Input::new(&self.config, text, files, None)?;
-                        ask(&self.config, self.abort.clone(), input).await?;
-                    }
-                    None => println!("Usage: .file <files>... [-- <text>...]"),
-                },
                 ".exit" => match args {
                     Some("role") => {
-                        self.config.write().clear_role()?;
+                        self.config.write().exit_role()?;
                     }
                     Some("session") => {
-                        self.config.write().end_session()?;
+                        self.config.write().exit_session()?;
+                    }
+                    Some("rag") => {
+                        self.config.write().exit_rag()?;
+                    }
+                    Some("agent") => {
+                        self.config.write().exit_agent()?;
                     }
                     Some(_) => unknown_command()?,
                     None => {
@@ -254,7 +398,7 @@ impl Repl {
             },
             None => {
                 let input = Input::from_str(&self.config, line, None);
-                ask(&self.config, self.abort.clone(), input).await?;
+                ask(&self.config, self.abort_signal.clone(), input, true).await?;
             }
         }
 
@@ -289,8 +433,7 @@ Type ".help" for additional help.
             .with_ansi_colors(true);
 
         if let Some(cmd) = config.read().buffer_editor() {
-            let temp_file =
-                env::temp_dir().join(format!("aichat-{}.txt", chrono::Utc::now().timestamp()));
+            let temp_file = temp_file("-repl-", ".txt");
             let command = process::Command::new(cmd);
             editor = editor.with_buffer_editor(command, temp_file);
         }
@@ -314,6 +457,16 @@ Type ".help" for additional help.
         );
         keybindings.add_binding(
             KeyModifiers::CONTROL,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+        );
+        keybindings.add_binding(
+            KeyModifiers::SHIFT,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+        );
+        keybindings.add_binding(
+            KeyModifiers::ALT,
             KeyCode::Enter,
             ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
@@ -352,20 +505,28 @@ Type ".help" for additional help.
 pub struct ReplCommand {
     name: &'static str,
     description: &'static str,
-    valid_states: Vec<State>,
+    state: AssertState,
 }
 
 impl ReplCommand {
-    fn new(name: &'static str, desc: &'static str, valid_states: Vec<State>) -> Self {
+    fn new(name: &'static str, desc: &'static str, state: AssertState) -> Self {
         Self {
             name,
             description: desc,
-            valid_states,
+            state,
         }
     }
 
-    fn is_valid(&self, state: &State) -> bool {
-        self.valid_states.contains(state)
+    fn is_valid(&self, flags: StateFlags) -> bool {
+        match self.state {
+            AssertState::True(true_flags) => true_flags & flags != StateFlags::empty(),
+            AssertState::False(false_flags) => false_flags & flags == StateFlags::empty(),
+            AssertState::TrueFalse(true_flags, false_flags) => {
+                (true_flags & flags != StateFlags::empty())
+                    && (false_flags & flags == StateFlags::empty())
+            }
+            AssertState::Equal(check_flags) => check_flags == flags,
+        }
     }
 }
 
@@ -384,48 +545,54 @@ impl Validator for ReplValidator {
 }
 
 #[async_recursion]
-async fn ask(config: &GlobalConfig, abort: AbortSignal, input: Input) -> Result<()> {
+async fn ask(
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
+    mut input: Input,
+    with_embeddings: bool,
+) -> Result<()> {
     if input.is_empty() {
         return Ok(());
     }
-    while config.read().is_compressing_session() {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if with_embeddings {
+        input.use_embeddings(abort_signal.clone()).await?;
     }
+    while config.read().is_compressing_session() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     let client = input.create_client()?;
-    let (output, tool_call_results) =
-        send_stream(&input, client.as_ref(), config, abort.clone()).await?;
+    config.write().before_chat_completion(&input)?;
+    let (output, tool_results) =
+        chat_completion_streaming(&input, client.as_ref(), config, abort_signal.clone()).await?;
     config
         .write()
-        .save_message(&input, &output, &tool_call_results)?;
-    config.read().maybe_copy(&output);
-    if config.write().should_compress_session() {
-        let config = config.clone();
-        let color = if config.read().light_theme {
-            Color::LightGray
-        } else {
-            Color::DarkGray
-        };
-        print!(
-            "\n📢 {}{}{}\n",
-            color.normal().paint(
-                "Session compression is being activated because the current tokens exceed `"
-            ),
-            color.italic().paint("compress_threshold"),
-            color.normal().paint("`."),
-        );
-        tokio::spawn(async move {
-            let _ = compress_session(&config).await;
-            config.write().end_compressing_session();
-        });
-    }
-    if need_send_call_results(&tool_call_results) {
+        .after_chat_completion(&input, &output, &tool_results)?;
+    if need_send_tool_results(&tool_results) {
         ask(
             config,
-            abort,
-            input.merge_tool_call(output, tool_call_results),
+            abort_signal,
+            input.merge_tool_call(output, tool_results),
+            false,
         )
         .await
     } else {
+        if config.write().should_compress_session() {
+            let config = config.clone();
+            let color = if config.read().light_theme {
+                Color::LightGray
+            } else {
+                Color::DarkGray
+            };
+            print!(
+                "\n📢 {}\n",
+                color.italic().paint("Compressing the session."),
+            );
+            tokio::spawn(async move {
+                let _ = compress_session(&config).await;
+                config.write().end_compressing_session();
+            });
+        }
         Ok(())
     }
 }
@@ -464,7 +631,7 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
 async fn compress_session(config: &GlobalConfig) -> Result<()> {
     let input = Input::from_str(config, config.read().summarize_prompt(), None);
     let client = input.create_client()?;
-    let summary = client.send_message(input).await?.text;
+    let summary = client.chat_completions(input).await?.text;
     config.write().compress_session(&summary);
     Ok(())
 }

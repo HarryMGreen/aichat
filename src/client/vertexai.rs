@@ -1,8 +1,5 @@
-use super::{
-    access_token::*, catch_error, json_stream, message::*, patch_system_message, Client,
-    CompletionData, CompletionOutput, ExtraConfig, Model, ModelData, ModelPatches, PromptAction,
-    PromptKind, SseHandler, ToolCall, VertexAIClient,
-};
+use super::access_token::*;
+use super::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -18,8 +15,6 @@ pub struct VertexAIConfig {
     pub project_id: Option<String>,
     pub location: Option<String>,
     pub adc_file: Option<String>,
-    #[serde(rename = "safetySettings")]
-    pub safety_settings: Option<Value>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patches: Option<ModelPatches>,
@@ -35,10 +30,10 @@ impl VertexAIClient {
         ("location", "Location", true, PromptKind::String),
     ];
 
-    fn request_builder(
+    fn chat_completions_builder(
         &self,
         client: &ReqwestClient,
-        data: CompletionData,
+        data: ChatCompletionsData,
     ) -> Result<RequestBuilder> {
         let project_id = self.get_project_id()?;
         let location = self.get_location()?;
@@ -52,10 +47,42 @@ impl VertexAIClient {
         };
         let url = format!("{base_url}/google/models/{}:{func}", self.model.name());
 
-        let mut body = gemini_build_body(data, &self.model)?;
-        self.patch_request_body(&mut body);
+        let mut body = gemini_build_chat_completions_body(data, &self.model)?;
+        self.patch_chat_completions_body(&mut body);
 
-        debug!("VertexAI Request: {url} {body}");
+        debug!("VertexAI Chat Completions Request: {url} {body}");
+
+        let builder = client.post(url).bearer_auth(access_token).json(&body);
+
+        Ok(builder)
+    }
+
+    fn embeddings_builder(
+        &self,
+        client: &ReqwestClient,
+        data: EmbeddingsData,
+    ) -> Result<RequestBuilder> {
+        let project_id = self.get_project_id()?;
+        let location = self.get_location()?;
+        let access_token = get_access_token(self.name())?;
+
+        let base_url = format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers");
+        let url = format!("{base_url}/google/models/{}:predict", self.model.name());
+
+        let task_type = match data.query {
+            true => "RETRIEVAL_DOCUMENT",
+            false => "QUESTION_ANSWERING",
+        };
+        let instances: Vec<_> = data
+            .texts
+            .into_iter()
+            .map(|v| json!({"task_type": task_type, "content": v}))
+            .collect();
+        let body = json!({
+            "instances": instances,
+        });
+
+        debug!("VertexAI Embeddings Request: {url} {body}");
 
         let builder = client.post(url).bearer_auth(access_token).json(&body);
 
@@ -67,29 +94,39 @@ impl VertexAIClient {
 impl Client for VertexAIClient {
     client_common_fns!();
 
-    async fn send_message_inner(
+    async fn chat_completions_inner(
         &self,
         client: &ReqwestClient,
-        data: CompletionData,
-    ) -> Result<CompletionOutput> {
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
-        let builder = self.request_builder(client, data)?;
-        gemini_send_message(builder).await
+        let builder = self.chat_completions_builder(client, data)?;
+        gemini_chat_completions(builder).await
     }
 
-    async fn send_message_streaming_inner(
+    async fn chat_completions_streaming_inner(
         &self,
         client: &ReqwestClient,
         handler: &mut SseHandler,
-        data: CompletionData,
+        data: ChatCompletionsData,
     ) -> Result<()> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
-        let builder = self.request_builder(client, data)?;
-        gemini_send_message_streaming(builder, handler).await
+        let builder = self.chat_completions_builder(client, data)?;
+        gemini_chat_completions_streaming(builder, handler).await
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: EmbeddingsData,
+    ) -> Result<Vec<Vec<f32>>> {
+        prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
+        let builder = self.embeddings_builder(client, data)?;
+        embeddings(builder).await
     }
 }
 
-pub async fn gemini_send_message(builder: RequestBuilder) -> Result<CompletionOutput> {
+pub async fn gemini_chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -97,10 +134,10 @@ pub async fn gemini_send_message(builder: RequestBuilder) -> Result<CompletionOu
         catch_error(&data, status.as_u16())?;
     }
     debug!("non-stream-data: {data}");
-    gemini_extract_completion_text(&data)
+    gemini_extract_chat_completions_text(&data)
 }
 
-pub async fn gemini_send_message_streaming(
+pub async fn gemini_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
 ) -> Result<()> {
@@ -140,7 +177,39 @@ pub async fn gemini_send_message_streaming(
     Ok(())
 }
 
-fn gemini_extract_completion_text(data: &Value) -> Result<CompletionOutput> {
+async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+    if !status.is_success() {
+        catch_error(&data, status.as_u16())?;
+    }
+    let res_body: EmbeddingsResBody =
+        serde_json::from_value(data).context("Invalid embeddings data")?;
+    let output = res_body
+        .predictions
+        .into_iter()
+        .map(|v| v.embeddings.values)
+        .collect();
+    Ok(output)
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBody {
+    predictions: Vec<EmbeddingsResBodyPrediction>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBodyPrediction {
+    embeddings: EmbeddingsResBodyPredictionEmbeddings,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingsResBodyPredictionEmbeddings {
+    values: Vec<f32>,
+}
+
+fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
     let text = data["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .unwrap_or_default();
@@ -171,7 +240,7 @@ fn gemini_extract_completion_text(data: &Value) -> Result<CompletionOutput> {
             bail!("Invalid response data: {data}");
         }
     }
-    let output = CompletionOutput {
+    let output = ChatCompletionsOutput {
         text: text.to_string(),
         tool_calls,
         id: None,
@@ -181,8 +250,11 @@ fn gemini_extract_completion_text(data: &Value) -> Result<CompletionOutput> {
     Ok(output)
 }
 
-pub(crate) fn gemini_build_body(data: CompletionData, model: &Model) -> Result<Value> {
-    let CompletionData {
+pub fn gemini_build_chat_completions_body(
+    data: ChatCompletionsData,
+    model: &Model,
+) -> Result<Value> {
+    let ChatCompletionsData {
         mut messages,
         temperature,
         top_p,
@@ -190,7 +262,12 @@ pub(crate) fn gemini_build_body(data: CompletionData, model: &Model) -> Result<V
         stream: _,
     } = data;
 
-    patch_system_message(&mut messages);
+    let system_message = if model.name().starts_with("gemini-1.5-") {
+        extract_system_message(&mut messages)
+    } else {
+        patch_system_message(&mut messages);
+        None
+    };
 
     let mut network_image_urls = vec![];
     let contents: Vec<Value> = messages
@@ -223,29 +300,29 @@ pub(crate) fn gemini_build_body(data: CompletionData, model: &Model) -> Result<V
                             .collect();
                         vec![json!({ "role": role, "parts": parts })]
                     },
-                    MessageContent::ToolResults((tool_call_results, _)) => {
-                        let function_call_parts: Vec<Value> = tool_call_results.iter().map(|tool_call_result| {
+                    MessageContent::ToolResults((tool_results, _)) => {
+                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
                             json!({
                                 "functionCall": {
-                                    "name": tool_call_result.call.name,
-                                    "args": tool_call_result.call.arguments,
+                                    "name": tool_result.call.name,
+                                    "args": tool_result.call.arguments,
                                 }
                             })
                         }).collect();
-                        let function_response_parts: Vec<Value> = tool_call_results.into_iter().map(|tool_call_result| {
+                        let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
                             json!({
                                 "functionResponse": {
-                                    "name": tool_call_result.call.name,
+                                    "name": tool_result.call.name,
                                     "response": {
-                                        "name": tool_call_result.call.name,
-                                        "content": tool_call_result.output,
+                                        "name": tool_result.call.name,
+                                        "content": tool_result.output,
                                     }
                                 }
                             })
                         }).collect();
                         vec![
-                            json!({ "role": "model", "parts": function_call_parts }),
-                            json!({ "role": "function", "parts": function_response_parts }),
+                            json!({ "role": "model", "parts": model_parts }),
+                            json!({ "role": "function", "parts": function_parts }),
                         ]
                     }
                 }
@@ -261,6 +338,10 @@ pub(crate) fn gemini_build_body(data: CompletionData, model: &Model) -> Result<V
 
     let mut body = json!({ "contents": contents, "generationConfig": {} });
 
+    if let Some(v) = system_message {
+        body["systemInstruction"] = json!({ "parts": [{"text": v }] });
+    }
+
     if let Some(v) = model.max_tokens_param() {
         body["generationConfig"]["maxOutputTokens"] = v.into();
     }
@@ -272,7 +353,18 @@ pub(crate) fn gemini_build_body(data: CompletionData, model: &Model) -> Result<V
     }
 
     if let Some(functions) = functions {
-        body["tools"] = json!([{ "functionDeclarations": *functions }]);
+        // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
+        let function_declarations: Vec<_> = functions.into_iter().map(|function| {
+            if function.parameters.is_empty_properties() {
+                json!({
+                    "name": function.name,
+                    "description": function.description,
+                })
+            } else {
+                json!(function)
+            }
+        }).collect();
+        body["tools"] = json!([{ "functionDeclarations": function_declarations }]);
     }
 
     Ok(body)

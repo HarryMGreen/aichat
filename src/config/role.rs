@@ -1,46 +1,60 @@
-use super::Input;
+use super::*;
 
 use crate::{
     client::{Message, MessageContent, MessageRole, Model},
+    function::{FunctionsFilter, SELECTED_ALL_FUNCTIONS},
     utils::{detect_os, detect_shell},
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const TEMP_ROLE: &str = "%%";
 pub const SHELL_ROLE: &str = "%shell%";
 pub const EXPLAIN_SHELL_ROLE: &str = "%explain-shell%";
 pub const CODE_ROLE: &str = "%code%";
 
 pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+pub trait RoleLike {
+    fn to_role(&self) -> Role;
+    fn model(&self) -> &Model;
+    fn model_mut(&mut self) -> &mut Model;
+    fn temperature(&self) -> Option<f64>;
+    fn top_p(&self) -> Option<f64>;
+    fn functions_filter(&self) -> Option<FunctionsFilter>;
+    fn set_model(&mut self, model: &Model);
+    fn set_temperature(&mut self, value: Option<f64>);
+    fn set_top_p(&mut self, value: Option<f64>);
+    fn set_functions_filter(&mut self, value: Option<FunctionsFilter>);
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Role {
-    pub name: String,
-    pub prompt: String,
+    name: String,
+    #[serde(default)]
+    prompt: String,
     #[serde(
         rename(serialize = "model", deserialize = "model"),
         skip_serializing_if = "Option::is_none"
     )]
-    pub model_id: Option<String>,
+    model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
+    top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_matcher: Option<String>,
+    functions_filter: Option<FunctionsFilter>,
+
+    #[serde(skip)]
+    model: Model,
 }
 
 impl Role {
-    pub fn temp(prompt: &str) -> Self {
+    pub fn new(name: &str, prompt: &str) -> Self {
         Self {
-            name: TEMP_ROLE.into(),
+            name: name.into(),
             prompt: prompt.into(),
-            temperature: None,
-            model_id: None,
-            top_p: None,
-            function_matcher: None,
+            ..Default::default()
         }
     }
 
@@ -71,16 +85,18 @@ async function timeout(ms) {
                 .into(),
                 None,
             ),
-            ("%functions%", String::new(), Some(".*".into())),
+            (
+                "%functions%",
+                String::new(),
+                Some(SELECTED_ALL_FUNCTIONS.into()),
+            ),
         ]
         .into_iter()
-        .map(|(name, prompt, function_matcher)| Self {
+        .map(|(name, prompt, functions_filter)| Self {
             name: name.into(),
             prompt,
-            model_id: None,
-            temperature: None,
-            top_p: None,
-            function_matcher,
+            functions_filter,
+            ..Default::default()
         })
         .collect()
     }
@@ -91,24 +107,55 @@ async function timeout(ms) {
         Ok(output.trim_end().to_string())
     }
 
-    pub fn empty_prompt(&self) -> bool {
+    pub fn sync<T: RoleLike>(&mut self, role_like: &T) {
+        let model = role_like.model();
+        let temperature = role_like.temperature();
+        let top_p = role_like.top_p();
+        let functions_filter = role_like.functions_filter();
+        self.batch_set(model, temperature, top_p, functions_filter);
+    }
+
+    pub fn batch_set(
+        &mut self,
+        model: &Model,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        functions_filter: Option<FunctionsFilter>,
+    ) {
+        self.set_model(model);
+        if temperature.is_some() {
+            self.set_temperature(temperature);
+        }
+        if top_p.is_some() {
+            self.set_top_p(top_p);
+        }
+        if functions_filter.is_some() {
+            self.set_functions_filter(functions_filter);
+        }
+    }
+
+    pub fn is_derived(&self) -> bool {
+        self.name.is_empty()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn is_empty_prompt(&self) -> bool {
         self.prompt.is_empty()
     }
 
-    pub fn embedded_prompt(&self) -> bool {
+    pub fn is_embedded_prompt(&self) -> bool {
         self.prompt.contains(INPUT_PLACEHOLDER)
-    }
-
-    pub fn set_model(&mut self, model: &Model) {
-        self.model_id = Some(model.id());
-    }
-
-    pub fn set_temperature(&mut self, value: Option<f64>) {
-        self.temperature = value;
-    }
-
-    pub fn set_top_p(&mut self, value: Option<f64>) {
-        self.top_p = value;
     }
 
     pub fn complete_prompt_args(&mut self, name: &str) {
@@ -128,9 +175,9 @@ async function timeout(ms) {
 
     pub fn echo_messages(&self, input: &Input) -> String {
         let input_markdown = input.render();
-        if self.empty_prompt() {
+        if self.is_empty_prompt() {
             input_markdown
-        } else if self.embedded_prompt() {
+        } else if self.is_embedded_prompt() {
             self.prompt.replace(INPUT_PLACEHOLDER, &input_markdown)
         } else {
             format!("{}\n\n{}", self.prompt, input.render())
@@ -139,9 +186,9 @@ async function timeout(ms) {
 
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let mut content = input.message_content();
-        if self.empty_prompt() {
+        let mut messages = if self.is_empty_prompt() {
             vec![Message::new(MessageRole::User, content)]
-        } else if self.embedded_prompt() {
+        } else if self.is_embedded_prompt() {
             content.merge_prompt(|v: &str| self.prompt.replace(INPUT_PLACEHOLDER, v));
             vec![Message::new(MessageRole::User, content)]
         } else {
@@ -163,7 +210,56 @@ async function timeout(ms) {
             }
             messages.push(Message::new(MessageRole::User, content));
             messages
+        };
+        if let Some(text) = input.continue_output() {
+            messages.push(Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text(text.into()),
+            ));
         }
+        messages
+    }
+}
+
+impl RoleLike for Role {
+    fn to_role(&self) -> Role {
+        self.clone()
+    }
+
+    fn model(&self) -> &Model {
+        &self.model
+    }
+
+    fn model_mut(&mut self) -> &mut Model {
+        &mut self.model
+    }
+
+    fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+
+    fn functions_filter(&self) -> Option<FunctionsFilter> {
+        self.functions_filter.clone()
+    }
+
+    fn set_model(&mut self, model: &Model) {
+        self.model = model.clone();
+    }
+
+    fn set_temperature(&mut self, value: Option<f64>) {
+        self.temperature = value;
+    }
+
+    fn set_top_p(&mut self, value: Option<f64>) {
+        self.top_p = value;
+    }
+
+    fn set_functions_filter(&mut self, value: Option<FunctionsFilter>) {
+        self.functions_filter = value;
     }
 }
 

@@ -18,6 +18,12 @@ pub struct Cli {
     /// Forces the session to be saved
     #[clap(long)]
     pub save_session: bool,
+    /// Start a agent
+    #[clap(short = 'a', long)]
+    pub agent: Option<String>,
+    /// Start a RAG
+    #[clap(short = 'R', long)]
+    pub rag: Option<String>,
     /// Serve the LLM API and WebAPP
     #[clap(long, value_name = "ADDRESS")]
     pub serve: Option<Option<String>>,
@@ -30,15 +36,15 @@ pub struct Cli {
     /// Include files with the message
     #[clap(short = 'f', long, value_name = "FILE")]
     pub file: Vec<String>,
-    /// Turn off syntax highlighting
-    #[clap(short = 'H', long)]
-    pub no_highlight: bool,
-    /// Turns off stream mode
+    /// Turn off stream mode
     #[clap(short = 'S', long)]
     pub no_stream: bool,
     /// Control text wrapping (no, auto, <max-width>)
     #[clap(short = 'w', long)]
     pub wrap: Option<String>,
+    /// Turn off syntax highlighting
+    #[clap(short = 'H', long)]
+    pub no_highlight: bool,
     /// Use light theme
     #[clap(long)]
     pub light_theme: bool,
@@ -48,15 +54,21 @@ pub struct Cli {
     /// Display information
     #[clap(long)]
     pub info: bool,
-    /// List all available models
+    /// List all available chat models
     #[clap(long)]
     pub list_models: bool,
-    /// List all available roles
+    /// List all roles
     #[clap(long)]
     pub list_roles: bool,
-    /// List all available sessions
+    /// List all sessions
     #[clap(long)]
     pub list_sessions: bool,
+    /// List all agents
+    #[clap(long)]
+    pub list_agents: bool,
+    /// List all RAGs
+    #[clap(long)]
+    pub list_rags: bool,
     /// Input text
     #[clap(trailing_var_arg = true)]
     text: Vec<String>,

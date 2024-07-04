@@ -1,16 +1,15 @@
-use super::{role::Role, session::Session, GlobalConfig};
+use super::*;
 
 use crate::client::{
-    init_client, list_models, Client, CompletionData, ImageUrl, Message, MessageContent,
+    init_client, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
     MessageContentPart, MessageRole, Model,
 };
-use crate::function::{ToolCallResult, ToolResults};
-use crate::utils::{base64_encode, sha256};
+use crate::function::{ToolResult, ToolResults};
+use crate::utils::{base64_encode, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
-use mime_guess::from_path;
 use std::{
     collections::HashMap,
     fs::File,
@@ -29,38 +28,56 @@ lazy_static! {
 pub struct Input {
     config: GlobalConfig,
     text: String,
+    patched_text: Option<String>,
+    continue_output: Option<String>,
+    regenerate: bool,
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
     tool_call: Option<ToolResults>,
-    context: InputContext,
+    rag_name: Option<String>,
+    role: Role,
+    with_session: bool,
+    with_agent: bool,
 }
 
 impl Input {
-    pub fn from_str(config: &GlobalConfig, text: &str, context: Option<InputContext>) -> Self {
+    pub fn from_str(config: &GlobalConfig, text: &str, role: Option<Role>) -> Self {
+        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Self {
             config: config.clone(),
             text: text.to_string(),
+            patched_text: None,
+            continue_output: None,
+            regenerate: false,
             medias: Default::default(),
             data_urls: Default::default(),
             tool_call: None,
-            context: context.unwrap_or_else(|| InputContext::from_config(config)),
+            rag_name: None,
+            role,
+            with_session,
+            with_agent,
         }
     }
 
-    pub fn new(
+    pub async fn from_files(
         config: &GlobalConfig,
         text: &str,
         files: Vec<String>,
-        context: Option<InputContext>,
+        role: Option<Role>,
     ) -> Result<Self> {
-        let mut texts = vec![text.to_string()];
+        let mut texts = vec![];
+        if !text.is_empty() {
+            texts.push(text.to_string());
+        };
         let mut medias = vec![];
         let mut data_urls = HashMap::new();
         let files: Vec<_> = files
             .iter()
             .map(|f| (f, is_image_ext(Path::new(f))))
             .collect();
-        let include_filepath = files.iter().filter(|(_, is_image)| !*is_image).count() > 1;
+        let multi_files = files.iter().filter(|(_, is_image)| !*is_image).count() > 1;
+        let loaders = config.read().document_loaders.clone();
+        let spinner = create_spinner("Loading files").await;
         for (file_item, is_image) in files {
             match resolve_local_file(file_item) {
                 Some(file_path) => {
@@ -72,7 +89,7 @@ impl Input {
                     } else {
                         let text = read_file(&file_path)
                             .with_context(|| format!("Unable to read file '{file_item}'"))?;
-                        if include_filepath {
+                        if multi_files {
                             texts.push(format!("`{file_item}`:\n~~~~~~\n{text}\n~~~~~~"));
                         } else {
                             texts.push(text);
@@ -83,19 +100,34 @@ impl Input {
                     if is_image {
                         medias.push(file_item.to_string())
                     } else {
-                        bail!("Unable to use remote file '{file_item}");
+                        let (text, _) = fetch(&loaders, file_item)
+                            .await
+                            .with_context(|| format!("Failed to load '{file_item}'"))?;
+                        if multi_files {
+                            texts.push(format!("`{file_item}`:\n~~~~~~\n{text}\n~~~~~~"));
+                        } else {
+                            texts.push(text);
+                        }
                     }
                 }
             }
         }
+        spinner.stop();
 
+        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Ok(Self {
             config: config.clone(),
             text: texts.join("\n"),
+            patched_text: None,
+            continue_output: None,
+            regenerate: false,
             medias,
             data_urls,
             tool_call: Default::default(),
-            context: context.unwrap_or_else(|| InputContext::from_config(config)),
+            rag_name: None,
+            role,
+            with_session,
+            with_agent,
         })
     }
 
@@ -108,75 +140,120 @@ impl Input {
     }
 
     pub fn text(&self) -> String {
-        self.text.clone()
+        match self.patched_text.clone() {
+            Some(text) => text,
+            None => self.text.clone(),
+        }
+    }
+
+    pub fn clear_patch(&mut self) {
+        self.patched_text = None;
     }
 
     pub fn set_text(&mut self, text: String) {
         self.text = text;
     }
 
-    pub fn merge_tool_call(
-        mut self,
-        output: String,
-        tool_call_results: Vec<ToolCallResult>,
-    ) -> Self {
-        match self.tool_call.as_mut() {
-            Some(exist_tool_call_results) => {
-                exist_tool_call_results.0.extend(tool_call_results);
-                exist_tool_call_results.1 = output;
+    pub fn continue_output(&self) -> Option<&str> {
+        self.continue_output.as_deref()
+    }
+
+    pub fn set_continue_output(&mut self, output: &str) {
+        let output = match &self.continue_output {
+            Some(v) => format!("{v}{output}"),
+            None => output.to_string(),
+        };
+        self.continue_output = Some(output);
+    }
+
+    pub fn regenerate(&self) -> bool {
+        self.regenerate
+    }
+
+    pub fn set_regenerate(&mut self) {
+        let role = self.config.read().extract_role();
+        if role.name() == self.role().name() {
+            self.role = role;
+        }
+        self.regenerate = true;
+    }
+
+    pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
+        if self.text.is_empty() {
+            return Ok(());
+        }
+        if !self.text.is_empty() {
+            let rag = self.config.read().rag.clone();
+            if let Some(rag) = rag {
+                let (top_k, min_score_vector_search, min_score_keyword_search) = {
+                    let config = self.config.read();
+                    (
+                        config.rag_top_k,
+                        config.rag_min_score_vector_search,
+                        config.rag_min_score_keyword_search,
+                    )
+                };
+                let rerank = match self.config.read().rag_reranker_model.clone() {
+                    Some(reranker_model_id) => {
+                        let min_score = self.config.read().rag_min_score_rerank;
+                        let rerank_model =
+                            Model::retrieve_reranker(&self.config.read(), &reranker_model_id)?;
+                        let rerank_client = init_client(&self.config, Some(rerank_model))?;
+                        Some((rerank_client, min_score))
+                    }
+                    None => None,
+                };
+                let embeddings = rag
+                    .search(
+                        &self.text,
+                        top_k,
+                        min_score_vector_search,
+                        min_score_keyword_search,
+                        rerank,
+                        abort_signal,
+                    )
+                    .await?;
+                let text = self.config.read().rag_template(&embeddings, &self.text);
+                self.patched_text = Some(text);
+                self.rag_name = Some(rag.name().to_string());
             }
-            None => self.tool_call = Some((tool_call_results, output)),
+        }
+        Ok(())
+    }
+
+    pub fn rag_name(&self) -> Option<&str> {
+        self.rag_name.as_deref()
+    }
+
+    pub fn merge_tool_call(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
+        match self.tool_call.as_mut() {
+            Some(exist_tool_results) => {
+                exist_tool_results.0.extend(tool_results);
+                exist_tool_results.1 = output;
+            }
+            None => self.tool_call = Some((tool_results, output)),
         }
         self
     }
 
-    pub fn model(&self) -> Model {
-        let model = self.config.read().model.clone();
-        if let Some(model_id) = self.role().and_then(|v| v.model_id.clone()) {
-            if model.id() != model_id {
-                if let Some(model) = list_models(&self.config.read())
-                    .into_iter()
-                    .find(|v| v.id() == model_id)
-                {
-                    return model.clone();
-                }
-            }
-        };
-        model
-    }
-
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
-        init_client(&self.config, Some(self.model()))
+        init_client(&self.config, Some(self.role().model().clone()))
     }
 
-    pub fn prepare_completion_data(&self, model: &Model, stream: bool) -> Result<CompletionData> {
+    pub fn prepare_completion_data(
+        &self,
+        model: &Model,
+        stream: bool,
+    ) -> Result<ChatCompletionsData> {
         if !self.medias.is_empty() && !model.supports_vision() {
-            bail!("The current model does not support vision.");
+            bail!("The current model does not support vision. Is the model configured with `supports_vision: true`?");
         }
         let messages = self.build_messages()?;
-        self.config.read().model.max_input_tokens_limit(&messages)?;
-        let (temperature, top_p) = if let Some(session) = self.session(&self.config.read().session)
-        {
-            (session.temperature(), session.top_p())
-        } else if let Some(role) = self.role() {
-            (role.temperature, role.top_p)
-        } else {
-            let config = self.config.read();
-            (config.temperature, config.top_p)
-        };
-        let mut functions = None;
-        if self.config.read().function_calling && model.supports_function_calling() {
-            let config = self.config.read();
-            let function_matcher = if let Some(session) = self.session(&config.session) {
-                session.function_matcher()
-            } else if let Some(role) = self.role() {
-                role.function_matcher.as_deref()
-            } else {
-                None
-            };
-            functions = config.function.select(function_matcher);
-        };
-        Ok(CompletionData {
+        self.config.read().model.guard_max_input_tokens(&messages)?;
+        let temperature = self.role().temperature();
+        let top_p = self.role().top_p();
+        let functions = self.config.read().select_functions(model, self.role());
+        Ok(ChatCompletionsData {
             messages,
             temperature,
             top_p,
@@ -188,10 +265,8 @@ impl Input {
     pub fn build_messages(&self) -> Result<Vec<Message>> {
         let mut messages = if let Some(session) = self.session(&self.config.read().session) {
             session.build_messages(self)
-        } else if let Some(role) = self.role() {
-            role.build_messages(self)
         } else {
-            vec![Message::new(MessageRole::User, self.message_content())]
+            self.role().build_messages(self)
         };
         if let Some(tool_results) = &self.tool_call {
             messages.push(Message::new(
@@ -205,19 +280,17 @@ impl Input {
     pub fn echo_messages(&self) -> String {
         if let Some(session) = self.session(&self.config.read().session) {
             session.echo_messages(self)
-        } else if let Some(role) = self.role() {
-            role.echo_messages(self)
         } else {
-            self.render()
+            self.role().echo_messages(self)
         }
     }
 
-    pub fn role(&self) -> Option<&Role> {
-        self.context.role.as_ref()
+    pub fn role(&self) -> &Role {
+        &self.role
     }
 
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
-        if self.context.session {
+        if self.with_session {
             session.as_ref()
         } else {
             None
@@ -225,11 +298,15 @@ impl Input {
     }
 
     pub fn session_mut<'a>(&self, session: &'a mut Option<Session>) -> Option<&'a mut Session> {
-        if self.context.session {
+        if self.with_session {
             session.as_mut()
         } else {
             None
         }
+    }
+
+    pub fn with_agent(&self) -> bool {
+        self.with_agent
     }
 
     pub fn summary(&self) -> String {
@@ -257,13 +334,14 @@ impl Input {
     }
 
     pub fn render(&self) -> String {
+        let text = self.text();
         if self.medias.is_empty() {
-            return self.text.clone();
+            return text;
         }
-        let text = if self.text.is_empty() {
-            self.text.to_string()
+        let tail_text = if text.is_empty() {
+            String::new()
         } else {
-            format!(" -- {}", self.text)
+            format!(" -- {text}")
         };
         let files: Vec<String> = self
             .medias
@@ -271,12 +349,12 @@ impl Input {
             .cloned()
             .map(|url| resolve_data_url(&self.data_urls, url))
             .collect();
-        format!(".file {}{}", files.join(" "), text)
+        format!(".file {}{}", files.join(" "), tail_text)
     }
 
     pub fn message_content(&self) -> MessageContent {
         if self.medias.is_empty() {
-            MessageContent::Text(self.text.clone())
+            MessageContent::Text(self.text())
         } else {
             let mut list: Vec<MessageContentPart> = self
                 .medias
@@ -287,39 +365,21 @@ impl Input {
                 })
                 .collect();
             if !self.text.is_empty() {
-                list.insert(
-                    0,
-                    MessageContentPart::Text {
-                        text: self.text.clone(),
-                    },
-                );
+                list.insert(0, MessageContentPart::Text { text: self.text() });
             }
             MessageContent::Array(list)
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct InputContext {
-    role: Option<Role>,
-    session: bool,
-}
-
-impl InputContext {
-    pub fn new(role: Option<Role>, session: bool) -> Self {
-        Self { role, session }
-    }
-
-    pub fn from_config(config: &GlobalConfig) -> Self {
-        let config = config.read();
-        InputContext::new(config.role.clone(), config.session.is_some())
-    }
-
-    pub fn role(role: Role) -> Self {
-        Self {
-            role: Some(role),
-            session: false,
-        }
+fn resolve_role(config: &Config, role: Option<Role>) -> (Role, bool, bool) {
+    match role {
+        Some(v) => (v, false, false),
+        None => (
+            config.extract_role(),
+            config.session.is_some(),
+            config.agent.is_some(),
+        ),
     }
 }
 
@@ -359,8 +419,16 @@ fn is_image_ext(path: &Path) -> bool {
 
 fn read_media_to_data_url<P: AsRef<Path>>(image_path: P) -> Result<String> {
     let image_path = image_path.as_ref();
-
-    let mime_type = from_path(image_path).first_or_octet_stream().to_string();
+    let mime_type = match image_path.extension().and_then(|v| v.to_str()) {
+        Some(extension) => match extension {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => bail!("Unsupported media type"),
+        },
+        None => bail!("Unknown media type"),
+    };
     let mut file = File::open(image_path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
