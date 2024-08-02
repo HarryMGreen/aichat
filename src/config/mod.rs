@@ -3,7 +3,7 @@ mod input;
 mod role;
 mod session;
 
-pub use self::agent::{list_agents, Agent, AgentConfig};
+pub use self::agent::{list_agents, Agent};
 pub use self::input::Input;
 pub use self::role::{Role, RoleLike, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
 use self::session::Session;
@@ -12,17 +12,18 @@ use crate::client::{
     create_client_config, list_chat_models, list_client_types, list_reranker_models, ClientConfig,
     Model, OPENAI_COMPATIBLE_PLATFORMS,
 };
-use crate::function::{FunctionDeclaration, Functions, FunctionsFilter, ToolResult};
+use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
-use fancy_regex::Regex;
+use indexmap::IndexMap;
 use inquire::{Confirm, Select};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::json;
+use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
 use std::{
     env,
@@ -40,6 +41,7 @@ const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.t
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
 const ROLES_FILE_NAME: &str = "roles.yaml";
+const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
 const RAGS_DIR_NAME: &str = "rags";
@@ -47,7 +49,7 @@ const FUNCTIONS_DIR_NAME: &str = "functions";
 const FUNCTIONS_FILE_NAME: &str = "functions.json";
 const FUNCTIONS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
-const AGENT_RAG_FILE_NAME: &str = "rag.bin";
+const AGENT_VARIABLES_FILE_NAME: &str = "variables.yaml";
 
 pub const TEMP_ROLE_NAME: &str = "%%";
 pub const TEMP_RAG_NAME: &str = "temp";
@@ -86,9 +88,10 @@ pub struct Config {
     pub top_p: Option<f64>,
 
     pub dry_run: bool,
+    pub stream: bool,
     pub save: bool,
-    pub keybindings: Keybindings,
-    pub buffer_editor: Option<String>,
+    pub keybindings: String,
+    pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
 
@@ -102,8 +105,8 @@ pub struct Config {
     pub summary_prompt: Option<String>,
 
     pub function_calling: bool,
-    pub dangerously_functions_filter: Option<FunctionsFilter>,
-    pub agents: Vec<AgentConfig>,
+    pub mapping_tools: IndexMap<String, String>,
+    pub use_tools: Option<String>,
 
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
@@ -113,9 +116,10 @@ pub struct Config {
     pub rag_min_score_vector_search: f32,
     pub rag_min_score_keyword_search: f32,
     pub rag_min_score_rerank: f32,
+    pub rag_template: Option<String>,
+
     #[serde(default)]
     pub document_loaders: HashMap<String, String>,
-    pub rag_template: Option<String>,
 
     pub highlight: bool,
     pub light_theme: bool,
@@ -152,9 +156,10 @@ impl Default for Config {
             top_p: None,
 
             dry_run: false,
+            stream: true,
             save: false,
-            keybindings: Default::default(),
-            buffer_editor: None,
+            keybindings: "emacs".into(),
+            editor: None,
             wrap: None,
             wrap_code: false,
 
@@ -162,9 +167,14 @@ impl Default for Config {
             repl_prelude: None,
             agent_prelude: None,
 
+            save_session: None,
+            compress_threshold: 4000,
+            summarize_prompt: None,
+            summary_prompt: None,
+
             function_calling: true,
-            dangerously_functions_filter: None,
-            agents: vec![],
+            mapping_tools: Default::default(),
+            use_tools: None,
 
             rag_embedding_model: None,
             rag_reranker_model: None,
@@ -174,13 +184,9 @@ impl Default for Config {
             rag_min_score_vector_search: 0.0,
             rag_min_score_keyword_search: 0.0,
             rag_min_score_rerank: 0.0,
-            document_loaders: Default::default(),
             rag_template: None,
 
-            save_session: None,
-            compress_threshold: 4000,
-            summarize_prompt: None,
-            summary_prompt: None,
+            document_loaders: Default::default(),
 
             highlight: true,
             light_theme: false,
@@ -207,29 +213,32 @@ pub type GlobalConfig = Arc<RwLock<Config>>;
 impl Config {
     pub fn init(working_mode: WorkingMode) -> Result<Self> {
         let config_path = Self::config_file()?;
-
-        let platform = env::var(get_env_name("platform")).ok();
-        if *IS_STDOUT_TERMINAL && platform.is_none() && !config_path.exists() {
-            create_config_file(&config_path)?;
-        }
-        let mut config = if platform.is_some() {
-            Self::load_config_env(&platform.unwrap())?
+        let mut config = if !config_path.exists() {
+            match env::var(get_env_name("platform")) {
+                Ok(v) => Self::load_dynamic(&v)?,
+                Err(_) => {
+                    if *IS_STDOUT_TERMINAL {
+                        create_config_file(&config_path)?;
+                    }
+                    Self::load_from_file(&config_path)?
+                }
+            }
         } else {
-            Self::load_config_file(&config_path)?
+            Self::load_from_file(&config_path)?
         };
+
+        config.working_mode = working_mode;
+
+        config.load_envs();
 
         if let Some(wrap) = config.wrap.clone() {
             config.set_wrap(&wrap)?;
         }
 
-        config.working_mode = working_mode;
-
         config.load_functions()?;
         config.load_roles()?;
 
         config.setup_model()?;
-        config.setup_highlight();
-        config.setup_light_theme()?;
         config.setup_document_loaders();
 
         Ok(config)
@@ -264,6 +273,13 @@ impl Config {
         match env::var(get_env_name("roles_file")) {
             Ok(value) => Ok(PathBuf::from(value)),
             Err(_) => Self::local_path(ROLES_FILE_NAME),
+        }
+    }
+
+    pub fn env_file() -> Result<PathBuf> {
+        match env::var(get_env_name("env_file")) {
+            Ok(value) => Ok(PathBuf::from(value)),
+            Err(_) => Self::local_path(ENV_FILE_NAME),
         }
     }
 
@@ -314,40 +330,45 @@ impl Config {
     }
 
     pub fn rag_file(&self, name: &str) -> Result<PathBuf> {
-        let path = if self.agent.is_none() {
-            Self::rags_dir()?.join(format!("{name}.bin"))
-        } else {
-            Self::rags_dir()?
-                .join(AGENTS_DIR_NAME)
-                .join(format!("{name}.bin"))
+        let path = match &self.agent {
+            Some(agent) => Self::agent_rag_file(agent.name(), name)?,
+            None => Self::rags_dir()?.join(format!("{name}.bin")),
         };
         Ok(path)
     }
 
     pub fn agents_config_dir() -> Result<PathBuf> {
-        match env::var(get_env_name("agents_config_dir")) {
-            Ok(value) => Ok(PathBuf::from(value)),
-            Err(_) => Self::local_path(AGENTS_DIR_NAME),
-        }
+        Self::local_path(AGENTS_DIR_NAME)
     }
 
     pub fn agent_config_dir(name: &str) -> Result<PathBuf> {
-        Ok(Self::agents_config_dir()?.join(name))
-    }
-
-    pub fn agent_rag_file(name: &str) -> Result<PathBuf> {
-        Ok(Self::agent_config_dir(name)?.join(AGENT_RAG_FILE_NAME))
-    }
-
-    pub fn agents_functions_dir() -> Result<PathBuf> {
-        match env::var(get_env_name("agents_functions_dir")) {
+        match env::var(format!("{}_CONFIG_DIR", normalize_env_name(name))) {
             Ok(value) => Ok(PathBuf::from(value)),
-            Err(_) => Ok(Self::functions_dir()?.join(AGENTS_DIR_NAME)),
+            Err(_) => Ok(Self::agents_config_dir()?.join(name)),
         }
     }
 
+    pub fn agent_config_file(name: &str) -> Result<PathBuf> {
+        Ok(Self::agent_config_dir(name)?.join(CONFIG_FILE_NAME))
+    }
+
+    pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> Result<PathBuf> {
+        Ok(Self::agent_config_dir(agent_name)?.join(format!("{rag_name}.bin")))
+    }
+
+    pub fn agent_variables_file(name: &str) -> Result<PathBuf> {
+        Ok(Self::agent_config_dir(name)?.join(AGENT_VARIABLES_FILE_NAME))
+    }
+
+    pub fn agents_functions_dir() -> Result<PathBuf> {
+        Ok(Self::functions_dir()?.join(AGENTS_DIR_NAME))
+    }
+
     pub fn agent_functions_dir(name: &str) -> Result<PathBuf> {
-        Ok(Self::agents_functions_dir()?.join(name))
+        match env::var(format!("{}_FUNCTIONS_DIR", normalize_env_name(name))) {
+            Ok(value) => Ok(PathBuf::from(value)),
+            Err(_) => Ok(Self::agents_functions_dir()?.join(name)),
+        }
     }
 
     pub fn state(&self) -> StateFlags {
@@ -369,6 +390,36 @@ impl Config {
             flags |= StateFlags::RAG;
         }
         flags
+    }
+
+    pub fn log(is_serve: bool) -> Result<(LevelFilter, Option<PathBuf>)> {
+        let log_level = env::var(get_env_name("log_level"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(match cfg!(debug_assertions) {
+                true => LevelFilter::Debug,
+                false => {
+                    if is_serve {
+                        LevelFilter::Info
+                    } else {
+                        LevelFilter::Off
+                    }
+                }
+            });
+        if log_level == LevelFilter::Off {
+            return Ok((log_level, None));
+        }
+        let log_path = match env::var(get_env_name("log_path")) {
+            Ok(v) => Some(PathBuf::from(v)),
+            Err(_) => match is_serve {
+                true => None,
+                false => Some(Config::local_path(&format!(
+                    "{}.log",
+                    env!("CARGO_CRATE_NAME")
+                ))?),
+            },
+        };
+        Ok((log_level, log_path))
     }
 
     pub fn current_model(&self) -> &Model {
@@ -413,6 +464,9 @@ impl Config {
         if role.top_p().is_none() && self.top_p.is_some() {
             role.set_top_p(self.top_p);
         }
+        if role.use_tools().is_none() && self.use_tools.is_some() {
+            role.set_use_tools(self.use_tools.clone())
+        }
         role
     }
 
@@ -448,7 +502,7 @@ impl Config {
             .clone()
             .map_or_else(|| String::from("no"), |v| v.to_string());
         let role = self.extract_role();
-        let items = vec![
+        let mut items = vec![
             ("model", role.model().id()),
             (
                 "max_output_tokens",
@@ -460,13 +514,15 @@ impl Config {
             ("temperature", format_option_value(&role.temperature())),
             ("top_p", format_option_value(&role.top_p())),
             ("dry_run", self.dry_run.to_string()),
+            ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
-            ("keybindings", self.keybindings.stringify().into()),
+            ("keybindings", self.keybindings.clone()),
             ("wrap", wrap),
             ("wrap_code", self.wrap_code.to_string()),
             ("save_session", format_option_value(&self.save_session)),
             ("compress_threshold", self.compress_threshold.to_string()),
             ("function_calling", self.function_calling.to_string()),
+            ("use_tools", format_option_value(&role.use_tools())),
             (
                 "rag_reranker_model",
                 format_option_value(&self.rag_reranker_model),
@@ -476,19 +532,15 @@ impl Config {
             ("light_theme", self.light_theme.to_string()),
             ("config_file", display_path(&Self::config_file()?)),
             ("roles_file", display_path(&Self::roles_file()?)),
+            ("env_file", display_path(&Self::env_file()?)),
             ("functions_dir", display_path(&Self::functions_dir()?)),
-            (
-                "agents_functions_dir",
-                display_path(&Self::agents_functions_dir()?),
-            ),
-            (
-                "agents_config_dir",
-                display_path(&Self::agents_config_dir()?),
-            ),
             ("rags_dir", display_path(&Self::rags_dir()?)),
             ("sessions_dir", display_path(&self.sessions_dir()?)),
             ("messages_file", display_path(&self.messages_file()?)),
         ];
+        if let Ok((_, Some(log_path))) = Self::log(self.working_mode.is_serve()) {
+            items.push(("log_path", display_path(&log_path)));
+        }
         let output = items
             .iter()
             .map(|(name, value)| format!("{name:<24}{value}"))
@@ -517,6 +569,18 @@ impl Config {
                 let value = parse_value(value)?;
                 self.set_top_p(value);
             }
+            "dry_run" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                self.dry_run = value;
+            }
+            "stream" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                self.stream = value;
+            }
+            "save" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                self.save = value;
+            }
             "rag_reranker_model" => {
                 self.rag_reranker_model = if value == "null" {
                     None
@@ -536,25 +600,21 @@ impl Config {
                 }
                 self.function_calling = value;
             }
-            "compress_threshold" => {
+            "use_tools" => {
                 let value = parse_value(value)?;
-                self.set_compress_threshold(value);
-            }
-            "save" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
-                self.save = value;
+                self.set_use_tools(value);
             }
             "save_session" => {
                 let value = parse_value(value)?;
                 self.set_save_session(value);
             }
+            "compress_threshold" => {
+                let value = parse_value(value)?;
+                self.set_compress_threshold(value);
+            }
             "highlight" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 self.highlight = value;
-            }
-            "dry_run" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
-                self.dry_run = value;
             }
             _ => bail!("Unknown key `{key}`"),
         }
@@ -572,6 +632,13 @@ impl Config {
         match self.role_like_mut() {
             Some(role_like) => role_like.set_top_p(value),
             None => self.top_p = value,
+        }
+    }
+
+    pub fn set_use_tools(&mut self, value: Option<String>) {
+        match self.role_like_mut() {
+            Some(role_like) => role_like.set_use_tools(value),
+            None => self.use_tools = value,
         }
     }
 
@@ -774,10 +841,7 @@ impl Config {
             Some(session) => session.name().to_string(),
             None => bail!("No session"),
         };
-        let editor = match self.buffer_editor() {
-            Some(editor) => editor,
-            None => bail!("No editor, please set $EDITOR/$VISUAL."),
-        };
+        let editor = self.editor()?;
         let session_path = self.session_file(&name)?;
         self.save_session(Some(&name))?;
         edit_file(&editor, &session_path).with_context(|| {
@@ -794,6 +858,9 @@ impl Config {
     pub fn clear_session_messages(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.clear_messages();
+            if let Some(prompt) = self.agent.as_ref().map(|v| v.interpolated_instructions()) {
+                session.update_role_prompt(&prompt);
+            }
         } else {
             bail!("No session")
         }
@@ -958,11 +1025,15 @@ impl Config {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = Agent::init(config, name, abort_signal).await?;
+        let session = session.map(|v| v.to_string()).or_else(|| {
+            agent
+                .agent_prelude()
+                .map(|v| v.to_string())
+                .or_else(|| config.read().agent_prelude.clone())
+                .and_then(|v| if v.is_empty() { None } else { Some(v) })
+        });
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
-        let session = session
-            .map(|v| v.to_string())
-            .or_else(|| config.read().agent_prelude.clone());
         if let Some(session) = session {
             config.write().use_session(Some(&session))?;
         }
@@ -985,6 +1056,20 @@ impl Config {
         }
     }
 
+    pub fn set_agent_variable(&mut self, data: &str) -> Result<()> {
+        let parts: Vec<&str> = data.split_whitespace().collect();
+        if parts.len() != 2 {
+            bail!("Usage: .variable <key> <value>");
+        }
+        let key = parts[0];
+        let value = parts[1];
+        match self.agent.as_mut() {
+            Some(agent) => agent.set_variable(key, value)?,
+            None => bail!("No agent"),
+        };
+        Ok(())
+    }
+
     pub fn exit_agent(&mut self) -> Result<()> {
         self.exit_session()?;
         if self.agent.take().is_some() {
@@ -1001,7 +1086,12 @@ impl Config {
             WorkingMode::Serve => return Ok(()),
         };
         let prelude = match prelude {
-            Some(v) => v.to_string(),
+            Some(v) => {
+                if v.is_empty() {
+                    return Ok(());
+                }
+                v.to_string()
+            }
             None => return Ok(()),
         };
 
@@ -1025,54 +1115,96 @@ impl Config {
     }
 
     pub fn select_functions(&self, model: &Model, role: &Role) -> Option<Vec<FunctionDeclaration>> {
-        let mut functions = None;
+        let mut functions = vec![];
         if self.function_calling {
-            let filter = role.functions_filter();
-            if let Some(filter) = filter {
-                functions = match &self.agent {
-                    Some(agent) => agent.functions().select(&filter),
-                    None => self.functions.select(&filter),
-                };
-                if !model.supports_function_calling() {
-                    functions = None;
-                    if *IS_STDOUT_TERMINAL {
-                        eprintln!("{}", warning_text("WARNING: This LLM or client does not support function calling, despite the context requiring it."));
+            if let Some(use_tools) = role.use_tools() {
+                let mut tool_names: HashSet<String> = Default::default();
+                let declaration_names: HashSet<String> = self
+                    .functions
+                    .declarations()
+                    .iter()
+                    .map(|v| v.name.to_string())
+                    .collect();
+                for item in use_tools.split(',') {
+                    let item = item.trim();
+                    if item == "all" {
+                        tool_names.extend(declaration_names);
+                        break;
+                    } else if let Some(values) = self.mapping_tools.get(item) {
+                        tool_names.extend(
+                            values
+                                .split(',')
+                                .map(|v| v.to_string())
+                                .filter(|v| declaration_names.contains(v)),
+                        )
+                    } else if declaration_names.contains(item) {
+                        tool_names.insert(item.to_string());
                     }
+                }
+                functions = self
+                    .functions
+                    .declarations()
+                    .iter()
+                    .filter_map(|v| {
+                        if tool_names.contains(&v.name) {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
+
+            if let Some(agent) = &self.agent {
+                let mut agent_functions = agent.functions().declarations().to_vec();
+                let tool_names: HashSet<String> = agent_functions
+                    .iter()
+                    .filter_map(|v| {
+                        if v.agent {
+                            None
+                        } else {
+                            Some(v.name.to_string())
+                        }
+                    })
+                    .collect();
+                agent_functions.extend(
+                    functions
+                        .into_iter()
+                        .filter(|v| !tool_names.contains(&v.name)),
+                );
+                functions = agent_functions;
+            }
+            if !functions.is_empty() && !model.supports_function_calling() {
+                functions.clear();
+                if *IS_STDOUT_TERMINAL {
+                    eprintln!("{}", warning_text("WARNING: This LLM or client does not support function calling, despite the context requiring it."));
                 }
             }
         };
-        functions
-    }
-
-    pub fn is_dangerously_function(&self, name: &str) -> bool {
-        if get_env_bool("no_dangerously_functions") {
-            return false;
-        }
-        let dangerously_functions_filter = match &self.agent {
-            Some(agent) => agent.config().dangerously_functions_filter.as_ref(),
-            None => self.dangerously_functions_filter.as_ref(),
-        };
-        match dangerously_functions_filter {
-            None => false,
-            Some(regex) => {
-                let regex = match Regex::new(&format!("^({regex})$")) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                regex.is_match(name).unwrap_or(false)
-            }
+        if functions.is_empty() {
+            None
+        } else {
+            Some(functions)
         }
     }
 
-    pub fn buffer_editor(&self) -> Option<String> {
-        self.buffer_editor
+    pub fn editor(&self) -> Result<String> {
+        self.editor
             .clone()
             .or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
+            .ok_or_else(|| anyhow!("No editor, please configure `editor` or set $EDITOR/$VISUAL environment variable."))
     }
 
-    pub fn repl_complete(&self, cmd: &str, args: &[&str]) -> Vec<(String, Option<String>)> {
-        let (values, filter) = if args.len() == 1 {
-            let values = match cmd {
+    pub fn repl_complete(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        line: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let mut values: Vec<(String, Option<String>)> = vec![];
+        let mut filter = "";
+        if args.len() == 1 {
+            values = match cmd {
                 ".role" => self
                     .roles
                     .iter()
@@ -1097,33 +1229,43 @@ impl Config {
                         .collect(),
                     None => vec![],
                 },
+                ".variable" => match &self.agent {
+                    Some(agent) => agent
+                        .variables()
+                        .iter()
+                        .map(|v| (v.name.clone(), Some(v.description.clone())))
+                        .collect(),
+                    None => vec![],
+                },
                 ".set" => vec![
                     "max_output_tokens",
                     "temperature",
                     "top_p",
-                    "rag_reranker_model",
-                    "rag_top_k",
-                    "function_calling",
-                    "compress_threshold",
+                    "dry_run",
+                    "stream",
                     "save",
                     "save_session",
+                    "compress_threshold",
+                    "function_calling",
+                    "use_tools",
+                    "rag_reranker_model",
+                    "rag_top_k",
                     "highlight",
-                    "dry_run",
                 ]
                 .into_iter()
                 .map(|v| (format!("{v} "), None))
                 .collect(),
                 _ => vec![],
             };
-            (values, args[0])
-        } else if args.len() == 2 {
-            let values = match args[0] {
+            filter = args[0]
+        } else if cmd == ".set" && args.len() == 2 {
+            let candidates = match args[0] {
                 "max_output_tokens" => match self.model.max_output_tokens() {
                     Some(v) => vec![v.to_string()],
                     None => vec![],
                 },
-                "rag_reranker_model" => list_reranker_models(self).iter().map(|v| v.id()).collect(),
-                "function_calling" => complete_bool(self.function_calling),
+                "dry_run" => complete_bool(self.dry_run),
+                "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
                 "save_session" => {
                     let save_session = if let Some(session) = &self.session {
@@ -1133,13 +1275,38 @@ impl Config {
                     };
                     complete_option_bool(save_session)
                 }
+                "function_calling" => complete_bool(self.function_calling),
+                "use_tools" => {
+                    let mut prefix = String::new();
+                    if let Some((v, _)) = args[1].rsplit_once(',') {
+                        prefix = format!("{v},");
+                    }
+                    let mut values = vec![];
+                    if prefix.is_empty() {
+                        values.push("all".to_string());
+                    }
+                    values.extend(self.mapping_tools.keys().map(|v| v.to_string()));
+                    values.extend(self.functions.declarations().iter().map(|v| v.name.clone()));
+                    values
+                        .into_iter()
+                        .filter(|v| !prefix.contains(&format!("{v},")))
+                        .map(|v| format!("{prefix}{v}"))
+                        .collect()
+                }
+                "rag_reranker_model" => list_reranker_models(self).iter().map(|v| v.id()).collect(),
                 "highlight" => complete_bool(self.highlight),
-                "dry_run" => complete_bool(self.dry_run),
                 _ => vec![],
             };
-            (values.into_iter().map(|v| (v, None)).collect(), args[1])
-        } else {
-            return vec![];
+            values = candidates.into_iter().map(|v| (v, None)).collect();
+            filter = args[1];
+        } else if cmd == ".starter" && args.len() >= 2 {
+            if let Some(agent) = &self.agent {
+                values = agent
+                    .conversation_staters()
+                    .iter()
+                    .filter_map(|v| v.strip_prefix(line).map(|x| (x.to_string(), None)))
+                    .collect()
+            }
         };
         values
             .into_iter()
@@ -1198,6 +1365,17 @@ impl Config {
         render_prompt(right_prompt, &variables)
     }
 
+    pub fn print_markdown(&self, text: &str) -> Result<()> {
+        if *IS_STDOUT_TERMINAL {
+            let render_options = self.render_options()?;
+            let mut markdown_render = MarkdownRender::init(render_options)?;
+            println!("{}", markdown_render.render(text));
+        } else {
+            println!("{text}");
+        }
+        Ok(())
+    }
+
     fn generate_prompt_context(&self) -> HashMap<&str, String> {
         let mut output = HashMap::new();
         let role = self.extract_role();
@@ -1223,6 +1401,9 @@ impl Config {
         }
         if self.dry_run {
             output.insert("dry_run", "true".to_string());
+        }
+        if self.stream {
+            output.insert("stream", "true".to_string());
         }
         if self.save {
             output.insert("save", "true".to_string());
@@ -1343,7 +1524,7 @@ impl Config {
             .with_context(|| format!("Failed to create/append {}", path.display()))
     }
 
-    fn load_config_file(config_path: &Path) -> Result<Self> {
+    fn load_from_file(config_path: &Path) -> Result<Self> {
         let content = read_to_string(config_path)
             .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
         let config: Self = serde_yaml::from_str(&content).map_err(|err| {
@@ -1365,10 +1546,10 @@ impl Config {
         Ok(config)
     }
 
-    fn load_config_env(platform: &str) -> Result<Self> {
-        let model_id = match env::var(get_env_name("model_name")) {
-            Ok(model_name) => format!("{platform}:{model_name}"),
-            Err(_) => platform.to_string(),
+    fn load_dynamic(model_id: &str) -> Result<Self> {
+        let platform = match model_id.split_once(':') {
+            Some((v, _)) => v,
+            _ => model_id,
         };
         let is_openai_compatible = OPENAI_COMPATIBLE_PLATFORMS
             .into_iter()
@@ -1379,13 +1560,142 @@ impl Config {
             json!({ "type": platform })
         };
         let config = json!({
-            "model": model_id,
+            "model": model_id.to_string(),
             "save": false,
             "clients": vec![client],
         });
         let config =
             serde_json::from_value(config).with_context(|| "Failed to load config from env")?;
         Ok(config)
+    }
+
+    fn load_envs(&mut self) {
+        if let Ok(v) = env::var(get_env_name("model")) {
+            self.model_id = v;
+        }
+        if let Some(v) = read_env_value::<f64>("temperature") {
+            self.temperature = v;
+        }
+        if let Some(v) = read_env_value::<f64>("top_p") {
+            self.top_p = v;
+        }
+
+        if let Some(Some(v)) = read_env_bool("dry_run") {
+            self.dry_run = v;
+        }
+        if let Some(Some(v)) = read_env_bool("stream") {
+            self.stream = v;
+        }
+        if let Some(Some(v)) = read_env_bool("save") {
+            self.save = v;
+        }
+        if let Ok(v) = env::var(get_env_name("keybindings")) {
+            if v == "vi" {
+                self.keybindings = v;
+            }
+        }
+        if let Some(v) = read_env_value::<String>("editor") {
+            self.editor = v;
+        }
+        if let Some(v) = read_env_value::<String>("wrap") {
+            self.wrap = v;
+        }
+        if let Some(Some(v)) = read_env_bool("wrap_code") {
+            self.wrap_code = v;
+        }
+
+        if let Some(v) = read_env_value::<String>("prelude") {
+            self.prelude = v;
+        }
+        if let Some(v) = read_env_value::<String>("repl_prelude") {
+            self.repl_prelude = v;
+        }
+        if let Some(v) = read_env_value::<String>("agent_prelude") {
+            self.agent_prelude = v;
+        }
+
+        if let Some(v) = read_env_bool("save_session") {
+            self.save_session = v;
+        }
+        if let Some(Some(v)) = read_env_value::<usize>("compress_threshold") {
+            self.compress_threshold = v;
+        }
+        if let Some(v) = read_env_value::<String>("summarize_prompt") {
+            self.summarize_prompt = v;
+        }
+        if let Some(v) = read_env_value::<String>("summary_prompt") {
+            self.summary_prompt = v;
+        }
+
+        if let Some(Some(v)) = read_env_bool("function_calling") {
+            self.function_calling = v;
+        }
+        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.mapping_tools = v;
+            }
+        }
+        if let Some(v) = read_env_value::<String>("use_tools") {
+            self.use_tools = v;
+        }
+
+        if let Some(v) = read_env_value::<String>("rag_embedding_model") {
+            self.rag_embedding_model = v;
+        }
+        if let Some(v) = read_env_value::<String>("rag_reranker_model") {
+            self.rag_reranker_model = v;
+        }
+        if let Some(Some(v)) = read_env_value::<usize>("rag_top_k") {
+            self.rag_top_k = v;
+        }
+        if let Some(v) = read_env_value::<usize>("rag_chunk_size") {
+            self.rag_chunk_size = v;
+        }
+        if let Some(v) = read_env_value::<usize>("rag_chunk_overlap") {
+            self.rag_chunk_overlap = v;
+        }
+        if let Some(Some(v)) = read_env_value::<f32>("rag_min_score_vector_search") {
+            self.rag_min_score_vector_search = v;
+        }
+        if let Some(Some(v)) = read_env_value::<f32>("rag_min_score_keyword_search") {
+            self.rag_min_score_keyword_search = v;
+        }
+        if let Some(Some(v)) = read_env_value::<f32>("rag_min_score_rerank") {
+            self.rag_min_score_rerank = v;
+        }
+        if let Some(v) = read_env_value::<String>("rag_template") {
+            self.rag_template = v;
+        }
+
+        if let Ok(v) = env::var(get_env_name("document_loaders")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.document_loaders = v;
+            }
+        }
+
+        if let Some(Some(v)) = read_env_bool("highlight") {
+            self.highlight = v;
+        }
+        if let Ok(value) = env::var("NO_COLOR") {
+            if let Some(false) = parse_bool(&value) {
+                self.highlight = false;
+            }
+        }
+        if let Some(Some(v)) = read_env_bool("light_theme") {
+            self.light_theme = v;
+        } else if !self.light_theme {
+            if let Ok(v) = env::var("COLORFGBG") {
+                if let Some(v) = light_theme_from_colorfgbg(&v) {
+                    self.light_theme = v
+                }
+            }
+        }
+        if let Some(v) = read_env_value::<String>("left_prompt") {
+            self.left_prompt = v;
+        }
+        if let Some(v) = read_env_value::<String>("right_prompt") {
+            self.right_prompt = v;
+        }
     }
 
     fn load_functions(&mut self) -> Result<()> {
@@ -1416,43 +1726,16 @@ impl Config {
     }
 
     fn setup_model(&mut self) -> Result<()> {
-        let model_id = if self.model_id.is_empty() {
+        let mut model_id = self.model_id.clone();
+        if model_id.is_empty() {
             let models = list_chat_models(self);
             if models.is_empty() {
                 bail!("No available model");
             }
-
-            models[0].id()
-        } else {
-            self.model_id.clone()
+            model_id = models[0].id()
         };
         self.set_model(&model_id)?;
         self.model_id = model_id;
-        Ok(())
-    }
-
-    fn setup_highlight(&mut self) {
-        if let Ok(value) = env::var("NO_COLOR") {
-            let mut no_color = false;
-            set_bool(&mut no_color, &value);
-            if no_color {
-                self.highlight = false;
-            }
-        }
-    }
-
-    fn setup_light_theme(&mut self) -> Result<()> {
-        if self.light_theme {
-            return Ok(());
-        }
-        if let Ok(value) = env::var(get_env_name("light_theme")) {
-            set_bool(&mut self.light_theme, &value);
-            return Ok(());
-        } else if let Ok(value) = env::var("COLORFGBG") {
-            if let Some(light) = light_theme_from_colorfgbg(&value) {
-                self.light_theme = light
-            }
-        };
         Ok(())
     }
 
@@ -1470,25 +1753,23 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub enum Keybindings {
-    #[serde(rename = "emacs")]
-    #[default]
-    Emacs,
-    #[serde(rename = "vi")]
-    Vi,
-}
-
-impl Keybindings {
-    pub fn is_vi(&self) -> bool {
-        matches!(self, Keybindings::Vi)
-    }
-    pub fn stringify(&self) -> &str {
-        match self {
-            Keybindings::Emacs => "emacs",
-            Keybindings::Vi => "vi",
+pub fn load_env_file() -> Result<()> {
+    let env_file_path = Config::env_file()?;
+    let contents = match read_to_string(&env_file_path) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    debug!("Use env file '{}'", env_file_path.display());
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            env::set_var(key.trim(), value.trim());
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1572,11 +1853,11 @@ pub(crate) fn ensure_parent_exists(path: &Path) -> Result<()> {
     }
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow!("Failed to write to {}, No parent path", path.display()))?;
+        .ok_or_else(|| anyhow!("Failed to write to '{}', No parent path", path.display()))?;
     if !parent.exists() {
         create_dir_all(parent).with_context(|| {
             format!(
-                "Failed to write {}, Cannot create parent directory",
+                "Failed to write to '{}', Cannot create parent directory",
                 path.display()
             )
         })?;
@@ -1584,12 +1865,13 @@ pub(crate) fn ensure_parent_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_bool(target: &mut bool, value: &str) {
-    match value {
-        "1" | "true" => *target = true,
-        "0" | "false" => *target = false,
-        _ => {}
-    }
+fn read_env_value<T>(key: &str) -> Option<Option<T>>
+where
+    T: std::str::FromStr,
+{
+    let value = env::var(get_env_name(key)).ok()?;
+    let value = parse_value(&value).ok()?;
+    Some(value)
 }
 
 fn parse_value<T>(value: &str) -> Result<Option<T>>
@@ -1606,6 +1888,19 @@ where
         Some(value)
     };
     Ok(value)
+}
+
+fn read_env_bool(key: &str) -> Option<Option<bool>> {
+    let value = env::var(get_env_name(key)).ok()?;
+    Some(parse_bool(&value))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn complete_bool(value: bool) -> Vec<String> {

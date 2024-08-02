@@ -80,7 +80,6 @@ test-server() {
 
 OPENAI_COMPATIBLE_PLATFORMS=( \
   openai,gpt-3.5-turbo,https://api.openai.com/v1 \
-  anyscale,meta-llama/Meta-Llama-3-8B-Instruct,https://api.endpoints.anyscale.com/v1 \
   deepinfra,meta-llama/Meta-Llama-3-8B-Instruct,https://api.deepinfra.com/v1/openai \
   deepseek,deepseek-chat,https://api.deepseek.com \
   fireworks,accounts/fireworks/models/llama-v3-8b-instruct,https://api.fireworks.ai/inference/v1 \
@@ -248,11 +247,12 @@ models-cohere() {
 }
 
 # @cmd Chat with ollama api
-# @option -m --model=codegemma $OLLAMA_MODEL
+# @env OLLAMA_BASE_URL=http://127.0.0.1:11434
+# @option -m --model=llama3.1:latest $OLLAMA_MODEL
 # @flag -S --no-stream
 # @arg text~
 chat-ollama() {
-    _wrapper curl -i http://localhost:11434/api/chat \
+    _wrapper curl -i $OLLAMA_BASE_URL/api/chat \
 -X POST \
 -H 'Content-Type: application/json' \
 -d "$(_build_body ollama "$@")"
@@ -453,10 +453,9 @@ _build_body() {
         file="${BODY_FILE:-"tmp/body/$1.json"}"
         if [[ -f "$file" ]]; then
             cat "$file" | \
-            sed \
-                -e 's/"model": ".*"/"model": "'"$argc_model"'"/' \
-                -e 's/"stream": \(true\|false\)/"stream": '$stream'/' \
-
+            sed -E \
+                -e 's%"model": ".*"%"model": "'"$argc_model"'"%' \
+                -e 's%"stream": (true|false)%"stream": '$stream'%' \
 
         fi
     else

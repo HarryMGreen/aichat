@@ -2,7 +2,6 @@ mod cli;
 mod client;
 mod config;
 mod function;
-mod logger;
 mod rag;
 mod render;
 mod repl;
@@ -14,46 +13,59 @@ mod utils;
 extern crate log;
 
 use crate::cli::Cli;
-use crate::client::{chat_completion_streaming, list_chat_models, ChatCompletionsOutput};
+use crate::client::{
+    call_chat_completions, call_chat_completions_streaming, list_chat_models, ChatCompletionsOutput,
+};
 use crate::config::{
-    list_agents, Config, GlobalConfig, Input, WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE,
-    SHELL_ROLE, TEMP_SESSION_NAME,
+    ensure_parent_exists, list_agents, load_env_file, Config, GlobalConfig, Input, WorkingMode,
+    CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
 };
 use crate::function::{eval_tool_calls, need_send_tool_results};
-use crate::render::{render_error, MarkdownRender};
+use crate::render::render_error;
 use crate::repl::Repl;
 use crate::utils::{
-    create_abort_signal, create_spinner, detect_shell, extract_block, run_command, AbortSignal,
-    Shell, CODE_BLOCK_RE, IS_STDOUT_TERMINAL,
+    create_abort_signal, create_spinner, extract_block, get_env_name, run_command,
+    run_with_spinner, AbortSignal, Shell, CODE_BLOCK_RE, IS_STDOUT_TERMINAL, SHELL,
 };
 
 use anyhow::{bail, Result};
-use async_recursion::async_recursion;
 use clap::Parser;
 use inquire::{Select, Text};
 use is_terminal::IsTerminal;
 use parking_lot::RwLock;
-use std::io::{stderr, stdin, Read};
-use std::process;
-use std::sync::Arc;
+use simplelog::{format_description, ConfigBuilder, LevelFilter, SimpleLogger, WriteLogger};
+use std::{
+    env,
+    io::{stderr, stdin, Read},
+    process,
+    sync::Arc,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_env_file()?;
     let cli = Cli::parse();
     let text = cli.text();
     let text = aggregate_text(text)?;
-    let file = &cli.file;
-    let no_input = text.is_none() && file.is_empty();
     let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
-    } else if no_input {
+    } else if text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {
         WorkingMode::Command
     };
-    crate::logger::setup_logger(working_mode)?;
+    setup_logger(working_mode.is_serve())?;
     let config = Arc::new(RwLock::new(Config::init(working_mode)?));
+    let highlight = config.read().highlight;
+    if let Err(err) = run(config, cli, text).await {
+        let highlight = stderr().is_terminal() && highlight;
+        render_error(err, highlight);
+        std::process::exit(1);
+    }
+    Ok(())
+}
 
+async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
     let abort_signal = create_abort_signal();
 
     if let Some(addr) = cli.serve {
@@ -82,12 +94,6 @@ async fn main() -> Result<()> {
         let rags = config.read().list_rags().join("\n");
         println!("{rags}");
         return Ok(());
-    }
-    if let Some(wrap) = &cli.wrap {
-        config.write().set_wrap(wrap)?;
-    }
-    if cli.light_theme {
-        config.write().light_theme = true;
     }
     if cli.dry_run {
         config.write().dry_run = true;
@@ -126,76 +132,67 @@ async fn main() -> Result<()> {
     if let Some(model_id) = &cli.model {
         config.write().set_model(model_id)?;
     }
+    if cli.no_stream {
+        config.write().stream = false;
+    }
     if cli.save_session {
         config.write().set_save_session(Some(true));
-    }
-    if cli.no_highlight {
-        config.write().highlight = false;
     }
     if cli.info {
         let info = config.read().info()?;
         println!("{}", info);
         return Ok(());
     }
-    if cli.execute {
-        if no_input {
-            bail!("No input");
-        }
-        let input = create_input(&config, text, file).await?;
-        let shell = detect_shell();
-        shell_execute(&config, &shell, input).await?;
+    let is_repl = config.read().working_mode.is_repl();
+    if cli.execute && !is_repl {
+        let input = create_input(&config, text, &cli.file).await?;
+        shell_execute(&config, &SHELL, input).await?;
         return Ok(());
     }
     config.write().apply_prelude()?;
-    if let Err(err) = match no_input {
+    match is_repl {
         false => {
-            let mut input = create_input(&config, text, file).await?;
+            let mut input = create_input(&config, text, &cli.file).await?;
             input.use_embeddings(abort_signal.clone()).await?;
-            start_directive(&config, input, cli.no_stream, cli.code, abort_signal).await
+            start_directive(&config, input, cli.code, abort_signal).await
         }
         true => start_interactive(&config).await,
-    } {
-        let highlight = stderr().is_terminal() && config.read().highlight;
-        render_error(err, highlight);
-        std::process::exit(1);
     }
-    Ok(())
 }
 
-#[async_recursion]
+#[async_recursion::async_recursion]
 async fn start_directive(
     config: &GlobalConfig,
     input: Input,
-    no_stream: bool,
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<()> {
     let client = input.create_client()?;
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if no_stream || extract_code {
-        let ChatCompletionsOutput {
-            text, tool_calls, ..
-        } = client.chat_completions(input.clone()).await?;
-        if !tool_calls.is_empty() {
-            (String::new(), eval_tool_calls(config, tool_calls)?)
-        } else {
-            let text = if extract_code && text.trim_start().starts_with("```") {
-                extract_block(&text)
-            } else {
-                text.clone()
-            };
-            if *IS_STDOUT_TERMINAL {
-                let render_options = config.read().render_options()?;
-                let mut markdown_render = MarkdownRender::init(render_options)?;
-                println!("{}", markdown_render.render(&text).trim());
-            } else {
-                println!("{}", text);
+    let (output, tool_results) = if !config.read().stream || extract_code {
+        let task = client.chat_completions(input.clone());
+        let ret = run_with_spinner(task, "Generating").await;
+        match ret {
+            Ok(ret) => {
+                let ChatCompletionsOutput {
+                    mut text,
+                    tool_calls,
+                    ..
+                } = ret;
+                if !text.is_empty() {
+                    if extract_code && text.trim_start().starts_with("```") {
+                        text = extract_block(&text);
+                    }
+                    config.read().print_markdown(&text)?;
+                }
+                (text, eval_tool_calls(config, tool_calls)?)
             }
-            (text, vec![])
+            Err(err) => return Err(err),
         }
     } else {
-        chat_completion_streaming(&input, client.as_ref(), config, abort_signal.clone()).await?
+        call_chat_completions_streaming(&input, client.as_ref(), config, abort_signal.clone())
+            .await?
     };
     config
         .write()
@@ -207,7 +204,6 @@ async fn start_directive(
         start_directive(
             config,
             input.merge_tool_call(output, tool_results),
-            no_stream,
             code_mode,
             abort_signal,
         )
@@ -241,10 +237,8 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
     config
         .write()
         .after_chat_completion(&input, &eval_str, &[])?;
-    let render_options = config.read().render_options()?;
-    let mut markdown_render = MarkdownRender::init(render_options)?;
     if config.read().dry_run {
-        println!("{}", markdown_render.render(&eval_str).trim());
+        config.read().print_markdown(&eval_str)?;
         return Ok(());
     }
     if *IS_STDOUT_TERMINAL {
@@ -273,7 +267,12 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
                     let role = config.read().retrieve_role(EXPLAIN_SHELL_ROLE)?;
                     let input = Input::from_str(config, &eval_str, Some(role));
                     let abort = create_abort_signal();
-                    chat_completion_streaming(&input, client.as_ref(), config, abort).await?;
+                    if config.read().stream {
+                        call_chat_completions_streaming(&input, client.as_ref(), config, abort)
+                            .await?;
+                    } else {
+                        call_chat_completions(&input, client.as_ref(), config).await?;
+                    }
                     continue;
                 }
                 _ => {}
@@ -315,4 +314,37 @@ async fn create_input(
         bail!("No input");
     }
     Ok(input)
+}
+
+fn setup_logger(is_serve: bool) -> Result<()> {
+    let (log_level, log_path) = Config::log(is_serve)?;
+    if log_level == LevelFilter::Off {
+        return Ok(());
+    }
+    let crate_name = env!("CARGO_CRATE_NAME");
+    let log_filter = match std::env::var(get_env_name("log_filter")) {
+        Ok(v) => v,
+        Err(_) => match is_serve {
+            true => format!("{crate_name}::serve"),
+            false => crate_name.into(),
+        },
+    };
+    let config = ConfigBuilder::new()
+        .add_filter_allow(log_filter)
+        .set_time_format_custom(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .set_thread_level(LevelFilter::Off)
+        .build();
+    match log_path {
+        None => {
+            SimpleLogger::init(log_level, config)?;
+        }
+        Some(log_path) => {
+            ensure_parent_exists(&log_path)?;
+            let log_file = std::fs::File::create(log_path)?;
+            WriteLogger::init(log_level, config, log_file)?;
+        }
+    }
+    Ok(())
 }

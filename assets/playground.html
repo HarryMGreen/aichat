@@ -251,7 +251,8 @@
     }
 
     .copy-message-btn,
-    .regenerate-message-btn {
+    .regenerate-message-btn,
+    .tts-message-btn {
       top: 0.7rem;
       right: 0.7rem;
       cursor: pointer;
@@ -260,7 +261,8 @@
     }
 
     .copy-message-btn svg,
-    .regenerate-message-btn svg {
+    .regenerate-message-btn svg,
+    .tts-message-btn svg {
       width: 1rem;
       height: 1rem;
     }
@@ -432,6 +434,11 @@
     }
 
     @media screen and (max-width: 768px) {
+      body {
+        height: calc(100vh - 56px);
+        height: 100dvh;
+      }
+
       .container {
         padding: 3px;
       }
@@ -492,16 +499,6 @@
         </div>
       </div>
       <div class="settings">
-        <div class="control">
-          <div class="checkbox-group">
-            <label for="compress_threshold">Session Compress Threshold</label>
-            <input type="checkbox" id="enable_session" title="Enable Session?" x-model="settings.enable_session"
-              :disabled="sessionMode">
-          </div>
-          <input type="number" :disabled="!settings.enable_session" id="compress_threshold"
-            x-model="settings.compress_threshold">
-        </div>
-
         <div class="control">
           <label for="role">Role</label>
           <select id="role" x-model="settings.role" :disabled="sessionMode" @change="handleRoleChange">
@@ -618,6 +615,16 @@
                       </svg>
                     </div>
                   </template>
+                  <template
+                    x-if="message.state == 'succeed' && !!window.speechSynthesis">
+                    <div class="tts-message-btn" @click="handleTTSMessage(message.content)" title="Text to speech">
+                      <svg fill="currentColor" viewBox="0 0 16 16">
+                        <path d="M11.536 14.01A8.47 8.47 0 0 0 14.026 8a8.47 8.47 0 0 0-2.49-6.01l-.708.707A7.48 7.48 0 0 1 13.025 8c0 2.071-.84 3.946-2.197 5.303z"/>
+                        <path d="M10.121 12.596A6.48 6.48 0 0 0 12.025 8a6.48 6.48 0 0 0-1.904-4.596l-.707.707A5.48 5.48 0 0 1 11.025 8a5.48 5.48 0 0 1-1.61 3.89z"/>
+                        <path d="M10.025 8a4.5 4.5 0 0 1-1.318 3.182L8 10.475A3.5 3.5 0 0 0 9.025 8c0-.966-.392-1.841-1.025-2.475l.707-.707A4.5 4.5 0 0 1 10.025 8M7 4a.5.5 0 0 0-.812-.39L3.825 5.5H1.5A.5.5 0 0 0 1 6v4a.5.5 0 0 0 .5.5h2.325l2.363 1.89A.5.5 0 0 0 7 12zM4.312 6.39 6 5.04v5.92L4.312 9.61A.5.5 0 0 0 4 9.5H2v-3h2a.5.5 0 0 0 .312-.11"/>
+                      </svg>
+                    </div>
+                  </template>
                 </div>
               </template>
             </div>
@@ -633,7 +640,7 @@
       <div class="input-panel">
         <div class="input-panel-inner">
           <textarea id="chat-input" x-model="input" x-ref="input" @keydown.enter="handleEnterKeydown"
-            placeholder="Ask Anything"></textarea>
+            placeholder="Ask Anything" autofocus></textarea>
           <div class="input-image-bar" x-show="images.length > 0">
             <template x-for="(image, index) in images">
               <div class="input-image-item">
@@ -707,8 +714,6 @@
         max_output_tokens: null,
         temperature: null,
         top_p: null,
-        enable_session: true,
-        compress_threshold: 4000,
       };
       try {
         const persistSettings = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY)) || {};
@@ -727,7 +732,6 @@
         currentModel: {},
         messages: [],
         hoveredMessageIndex: null,
-        skipMessageId: -1,
         input: "",
         images: [],
         asking: false,
@@ -816,6 +820,19 @@
           this.ask();
         },
 
+        /**
+         * @param {string} messageToUtter
+         */
+        handleTTSMessage(messageToUtter) {
+          if (!!window.speechSynthesis) {
+            if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+              window.speechSynthesis.cancel();
+            } else {
+              let utterance = new SpeechSynthesisUtterance(messageToUtter);
+              window.speechSynthesis.speak(utterance);
+            }
+          }
+        },
 
         handleCancelAsk() {
           this.askAbortController?.abort();
@@ -950,34 +967,14 @@
             lastMessage.html = renderMarkdown(lastMessage.content, lastMessage.error);
           }
           if (succeed) {
-            if (this.settings.enable_session) {
-              this.sessionMode = true;
-            }
-            const countTokens = [...body.messages.map(v => v.content), lastMessage.content].reduce((acc, cur) => acc + estimateTokenLength(cur), 0);
-            if (countTokens > this.settings.compress_threshold) {
-              const { messages } = body;
-              messages.push({ role: "assistant", content: lastMessage.content });
-              messages.push({ role: "user", content: "Summarize the discussion briefly in 200 words or less to use as a prompt for future context." });
-              try {
-                toast("Compressing session...", 30000);
-                const iter = await fetchChatCompletions(CHAT_COMPLETIONS_URL, { model: this.settings.model_id, messages, stream: false });
-                const summarizedData = await iter.next();
-                const summarizedText = summarizedData?.value?.choices[0]?.message?.content;
-                this.summary = "This is a summary of the chat history as a recap: " + summarizedText;
-                this.skipMessageId = lastMessage.id;
-                toast("Session compressed!");
-              } catch (err) {
-                toast("❌ Failed to compress session.");
-                console.error("Failed to compress session", err);
-              }
-            }
+            this.sessionMode = true;
           }
           this.asking = false;
         },
 
         buildBody() {
           let messages = [];
-          for ([userMessage, assistantMessage] of chunkArray(this.messages.filter(v => v.id > this.skipMessageId), 2)) {
+          for ([userMessage, assistantMessage] of chunkArray(this.messages, 2)) {
             if (assistantMessage.state == "failed") {
               continue;
             } else if (assistantMessage.state == "loading") {
@@ -985,7 +982,7 @@
                 role: userMessage.role,
                 content: userMessage.content,
               });
-            } else if (this.settings.enable_session) {
+            } else {
               messages.push({
                 role: userMessage.role,
                 content: userMessage.content,
@@ -1146,7 +1143,7 @@
         const index = text.indexOf(search);
 
         if (index !== -1) {
-          if (system == null) {
+          if (system === null) {
             system = text.slice(0, index);
           } else {
             parts.push(text.slice(0, index));
@@ -1155,7 +1152,7 @@
           text = text.slice(index + search.length);
         } else {
           if (text.trim()) {
-            if (system == null) {
+            if (system === null) {
               system = text;
             } else {
               parts.push(text);
@@ -1194,29 +1191,6 @@
         reader.onload = (event) => resolve(event.target.result);
         reader.onerror = (error) => reject(error);
       });
-    }
-
-    function estimateTokenLength(input) {
-      let tokenLength = 0;
-      if (Array.isArray(input)) {
-        input = input.map(v => v.text || "").join("");
-      }
-
-      for (let i = 0; i < input.length; i++) {
-        const charCode = input.charCodeAt(i);
-
-        if (charCode < 128) {
-          if (charCode <= 122 && charCode >= 65) {
-            tokenLength += 0.25;
-          } else {
-            tokenLength += 0.5;
-          }
-        } else {
-          tokenLength += 1.5;
-        }
-      }
-
-      return tokenLength;
     }
 
     function setupMarked() {

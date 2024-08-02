@@ -6,16 +6,14 @@ use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 
-use crate::client::chat_completion_streaming;
+use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{AssertState, Config, GlobalConfig, Input, StateFlags};
 use crate::function::need_send_tool_results;
 use crate::render::render_error;
 use crate::utils::{create_abort_signal, set_text, temp_file, AbortSignal};
 
 use anyhow::{bail, Context, Result};
-use async_recursion::async_recursion;
 use fancy_regex::Regex;
-use lazy_static::lazy_static;
 use nu_ansi_term::Color;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
@@ -25,15 +23,15 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::{env, process};
 
-lazy_static! {
+lazy_static::lazy_static! {
     static ref SPLIT_FILES_TEXT_ARGS_RE: Regex =
         Regex::new(r"(?m) (-- |--\n|--\r\n|--\r|--$)").unwrap();
 }
 
 const MENU_NAME: &str = "completion_menu";
 
-lazy_static! {
-    static ref REPL_COMMANDS: [ReplCommand; 27] = [
+lazy_static::lazy_static! {
+    static ref REPL_COMMANDS: [ReplCommand; 28] = [
         ReplCommand::new(".help", "Show this help message", AssertState::pass()),
         ReplCommand::new(".info", "View system info", AssertState::pass()),
         ReplCommand::new(".model", "Change the current LLM", AssertState::pass()),
@@ -116,6 +114,11 @@ lazy_static! {
         ReplCommand::new(
             ".starter",
             "Use the conversation starter",
+            AssertState::True(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".variable",
+            "Set agent variable",
             AssertState::True(StateFlags::AGENT)
         ),
         ReplCommand::new(
@@ -281,16 +284,15 @@ impl Repl {
                     }
                     None => {
                         let banner = self.config.read().agent_banner()?;
-                        let output = format!(
-                            r#"Usage: .starter <text>...
-
-Tips: use <tab> to autocomplete conversation starter text.
----------------------------------------------------------
-
-{banner}"#
-                        );
-
-                        println!("{output}");
+                        self.config.read().print_markdown(&banner)?;
+                    }
+                },
+                ".variable" => match args {
+                    Some(args) => {
+                        self.config.write().set_agent_variable(args)?;
+                    }
+                    _ => {
+                        println!("Usage: .variable <key> <value>")
                     }
                 },
                 ".save" => {
@@ -408,9 +410,10 @@ Tips: use <tab> to autocomplete conversation starter text.
     }
 
     fn banner(&self) {
+        let name = env!("CARGO_CRATE_NAME");
         let version = env!("CARGO_PKG_VERSION");
         print!(
-            r#"Welcome to aichat {version}
+            r#"Welcome to {name} {version}
 Type ".help" for additional help.
 "#
         )
@@ -432,7 +435,7 @@ Type ".help" for additional help.
             .with_validator(Box::new(ReplValidator))
             .with_ansi_colors(true);
 
-        if let Some(cmd) = config.read().buffer_editor() {
+        if let Ok(cmd) = config.read().editor() {
             let temp_file = temp_file("-repl-", ".txt");
             let command = process::Command::new(cmd);
             editor = editor.with_buffer_editor(command, temp_file);
@@ -473,7 +476,7 @@ Type ".help" for additional help.
     }
 
     fn create_edit_mode(config: &GlobalConfig) -> Box<dyn EditMode> {
-        let edit_mode: Box<dyn EditMode> = if config.read().keybindings.is_vi() {
+        let edit_mode: Box<dyn EditMode> = if config.read().keybindings == "vi" {
             let mut normal_keybindings = default_vi_normal_keybindings();
             let mut insert_keybindings = default_vi_insert_keybindings();
             Self::extra_keybindings(&mut normal_keybindings);
@@ -544,7 +547,7 @@ impl Validator for ReplValidator {
     }
 }
 
-#[async_recursion]
+#[async_recursion::async_recursion]
 async fn ask(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
@@ -563,8 +566,12 @@ async fn ask(
 
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) =
-        chat_completion_streaming(&input, client.as_ref(), config, abort_signal.clone()).await?;
+    let (output, tool_results) = if config.read().stream {
+        call_chat_completions_streaming(&input, client.as_ref(), config, abort_signal.clone())
+            .await?
+    } else {
+        call_chat_completions(&input, client.as_ref(), config).await?
+    };
     config
         .write()
         .after_chat_completion(&input, &output, &tool_results)?;

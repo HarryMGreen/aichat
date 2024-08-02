@@ -1,7 +1,7 @@
 use super::*;
 
-use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use anyhow::{bail, Context, Result};
+use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -12,7 +12,7 @@ pub struct OllamaConfig {
     pub api_auth: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patches: Option<ModelPatches>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -31,64 +31,63 @@ impl OllamaClient {
             PromptKind::Integer,
         ),
     ];
-
-    fn chat_completions_builder(
-        &self,
-        client: &ReqwestClient,
-        data: ChatCompletionsData,
-    ) -> Result<RequestBuilder> {
-        let api_base = self.get_api_base()?;
-        let api_auth = self.get_api_auth().ok();
-
-        let mut body = build_chat_completions_body(data, &self.model)?;
-        self.patch_chat_completions_body(&mut body);
-
-        let url = format!("{api_base}/api/chat");
-
-        debug!("Ollama Chat Completions Request: {url} {body}");
-
-        let mut builder = client.post(url).json(&body);
-        if let Some(api_auth) = api_auth {
-            builder = builder.header("Authorization", api_auth)
-        }
-
-        Ok(builder)
-    }
-
-    fn embeddings_builder(
-        &self,
-        client: &ReqwestClient,
-        data: EmbeddingsData,
-    ) -> Result<RequestBuilder> {
-        let api_base = self.get_api_base()?;
-        let api_auth = self.get_api_auth().ok();
-
-        let body = json!({
-            "model": self.model.name(),
-            "prompt": data.texts[0],
-        });
-
-        let url = format!("{api_base}/api/embeddings");
-
-        debug!("Ollama Embeddings Request: {url} {body}");
-
-        let mut builder = client.post(url).json(&body);
-        if let Some(api_auth) = api_auth {
-            builder = builder.header("Authorization", api_auth)
-        }
-
-        Ok(builder)
-    }
 }
 
 impl_client_trait!(
     OllamaClient,
-    chat_completions,
-    chat_completions_streaming,
-    embeddings
+    (
+        prepare_chat_completions,
+        chat_completions,
+        chat_completions_streaming
+    ),
+    (prepare_embeddings, embeddings),
+    (noop_prepare_rerank, noop_rerank),
 );
 
-async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
+fn prepare_chat_completions(
+    self_: &OllamaClient,
+    data: ChatCompletionsData,
+) -> Result<RequestData> {
+    let api_base = self_.get_api_base()?;
+    let api_auth = self_.get_api_auth().ok();
+
+    let url = format!("{api_base}/api/chat");
+
+    let body = build_chat_completions_body(data, &self_.model)?;
+
+    let mut request_data = RequestData::new(url, body);
+
+    if let Some(api_auth) = api_auth {
+        request_data.header("Authorization", api_auth)
+    }
+
+    Ok(request_data)
+}
+
+fn prepare_embeddings(self_: &OllamaClient, data: EmbeddingsData) -> Result<RequestData> {
+    let api_base = self_.get_api_base()?;
+    let api_auth = self_.get_api_auth().ok();
+
+    let url = format!("{api_base}/api/embed");
+
+    let body = json!({
+        "model": self_.model.name(),
+        "input": data.texts,
+    });
+
+    let mut request_data = RequestData::new(url, body);
+
+    if let Some(api_auth) = api_auth {
+        request_data.header("Authorization", api_auth)
+    }
+
+    Ok(request_data)
+}
+
+async fn chat_completions(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data = res.json().await?;
@@ -96,15 +95,14 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
         catch_error(&data, status.as_u16())?;
     }
     debug!("non-stream-data: {data}");
-    let text = data["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Invalid response data: {data}"))?;
-    Ok(ChatCompletionsOutput::new(text))
+
+    extract_chat_completions(&data)
 }
 
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
+    _model: &Model,
 ) -> Result<()> {
     let res = builder.send().await?;
     let status = res.status();
@@ -133,7 +131,7 @@ async fn chat_completions_streaming(
     Ok(())
 }
 
-async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data = res.json().await?;
@@ -142,13 +140,12 @@ async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
     }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;
-    let output = vec![res_body.embedding];
-    Ok(output)
+    Ok(res_body.embeddings)
 }
 
 #[derive(Deserialize)]
 struct EmbeddingsResBody {
-    embedding: Vec<f32>,
+    embeddings: Vec<Vec<f32>>,
 }
 
 fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Result<Value> {
@@ -156,22 +153,21 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         messages,
         temperature,
         top_p,
-        functions: _,
+        functions,
         stream,
     } = data;
 
-    let mut is_tool_call = false;
     let mut network_image_urls = vec![];
 
     let messages: Vec<Value> = messages
         .into_iter()
-        .map(|message| {
-            let role = message.role;
-            match message.content {
-                MessageContent::Text(text) => json!({
+        .flat_map(|message| {
+            let Message { role, content } = message;
+            match content {
+                MessageContent::Text(text) => vec![json!({
                     "role": role,
                     "content": text,
-                }),
+                })],
                 MessageContent::Array(list) => {
                     let mut content = vec![];
                     let mut images = vec![];
@@ -195,19 +191,33 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         }
                     }
                     let content = content.join("\n\n");
-                    json!({ "role": role, "content": content, "images": images })
+                    vec![json!({ "role": role, "content": content, "images": images })]
                 }
-                MessageContent::ToolResults(_) => {
-                    is_tool_call = true;
-                    json!({ "role": role })
-                }
+                MessageContent::ToolResults((tool_results, text)) => {
+                    let tool_calls: Vec<_> = tool_results.iter().map(|tool_result| {
+                        json!({
+                            "function": {
+                                "name": tool_result.call.name,
+                                "arguments": tool_result.call.arguments,
+                            },
+                        })
+                    }).collect();
+                    let mut messages = vec![
+                        json!({ "role": MessageRole::Assistant, "content": text, "tool_calls": tool_calls })
+                    ];
+                    for tool_result in tool_results {
+                        messages.push(
+                            json!({
+                                "role": "tool",
+                                "content": tool_result.output.to_string(),
+                            })
+                        );
+                    }
+                    messages
+                },
             }
         })
         .collect();
-
-    if is_tool_call {
-        bail!("The client does not support function calling",);
-    }
 
     if !network_image_urls.is_empty() {
         bail!(
@@ -232,6 +242,50 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     if let Some(v) = top_p {
         body["options"]["top_p"] = v.into();
     }
+    if let Some(functions) = functions {
+        body["tools"] = functions
+            .iter()
+            .map(|v| {
+                json!({
+                    "type": "function",
+                    "function": v,
+                })
+            })
+            .collect();
+    }
 
     Ok(body)
+}
+
+fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
+    let text = data["message"]["content"].as_str().unwrap_or_default();
+
+    let mut tool_calls = vec![];
+    if let Some(calls) = data["message"]["tool_calls"].as_array() {
+        tool_calls = calls
+            .iter()
+            .filter_map(|call| {
+                if let (Some(name), arguments) = (
+                    call["function"]["name"].as_str(),
+                    call["function"]["arguments"].clone(),
+                ) {
+                    Some(ToolCall::new(name.to_string(), arguments, None))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    if text.is_empty() && tool_calls.is_empty() {
+        bail!("Invalid response data: {data}");
+    }
+    let output = ChatCompletionsOutput {
+        text: text.to_string(),
+        tool_calls,
+        id: None,
+        input_tokens: data["prompt_eval_count"].as_u64(),
+        output_tokens: data["eval_count"].as_u64(),
+    };
+    Ok(output)
 }

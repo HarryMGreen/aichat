@@ -3,7 +3,6 @@ use super::*;
 use crate::utils::{base64_decode, sha256};
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_trait::async_trait;
 use reqwest::{
     multipart::{Form, Part},
     Client as ReqwestClient, RequestBuilder,
@@ -27,7 +26,7 @@ pub struct QianwenConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patches: Option<ModelPatches>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -36,69 +35,9 @@ impl QianwenClient {
 
     pub const PROMPTS: [PromptAction<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
-
-    fn chat_completions_builder(
-        &self,
-        client: &ReqwestClient,
-        data: ChatCompletionsData,
-    ) -> Result<RequestBuilder> {
-        let api_key = self.get_api_key()?;
-
-        let stream = data.stream;
-
-        let url = match self.model.supports_vision() {
-            true => CHAT_COMPLETIONS_API_URL_VL,
-            false => CHAT_COMPLETIONS_API_URL,
-        };
-        let (mut body, has_upload) = build_chat_completions_body(data, &self.model)?;
-        self.patch_chat_completions_body(&mut body);
-
-        debug!("Qianwen Chat Completions Request: {url} {body}");
-
-        let mut builder = client.post(url).bearer_auth(api_key).json(&body);
-        if stream {
-            builder = builder.header("X-DashScope-SSE", "enable");
-        }
-        if has_upload {
-            builder = builder.header("X-DashScope-OssResourceResolve", "enable");
-        }
-
-        Ok(builder)
-    }
-
-    fn embeddings_builder(
-        &self,
-        client: &ReqwestClient,
-        data: EmbeddingsData,
-    ) -> Result<RequestBuilder> {
-        let api_key = self.get_api_key()?;
-
-        let text_type = match data.query {
-            true => "query",
-            false => "document",
-        };
-
-        let body = json!({
-            "model": self.model.name(),
-            "input": {
-                "texts": data.texts,
-            },
-            "parameters": {
-                "text_type": text_type,
-            }
-        });
-
-        let url = EMBEDDINGS_API_URL;
-
-        debug!("Qianwen Embeddings Request: {url} {body}");
-
-        let builder = client.post(url).bearer_auth(api_key).json(&body);
-
-        Ok(builder)
-    }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl Client for QianwenClient {
     client_common_fns!();
 
@@ -109,7 +48,8 @@ impl Client for QianwenClient {
     ) -> Result<ChatCompletionsOutput> {
         let api_key = self.get_api_key()?;
         patch_messages(self.model.name(), &api_key, &mut data.messages).await?;
-        let builder = self.chat_completions_builder(client, data)?;
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
         chat_completions(builder, &self.model).await
     }
 
@@ -121,7 +61,8 @@ impl Client for QianwenClient {
     ) -> Result<()> {
         let api_key = self.get_api_key()?;
         patch_messages(self.model.name(), &api_key, &mut data.messages).await?;
-        let builder = self.chat_completions_builder(client, data)?;
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
         chat_completions_streaming(builder, handler, &self.model).await
     }
 
@@ -130,9 +71,64 @@ impl Client for QianwenClient {
         client: &ReqwestClient,
         data: EmbeddingsData,
     ) -> Result<Vec<Vec<f32>>> {
-        let builder = self.embeddings_builder(client, data)?;
-        embeddings(builder).await
+        let request_data = prepare_embeddings(self, data)?;
+        let builder = self.request_builder(client, request_data, ApiType::Embeddings);
+        embeddings(builder, &self.model).await
     }
+}
+
+fn prepare_chat_completions(
+    self_: &QianwenClient,
+    data: ChatCompletionsData,
+) -> Result<RequestData> {
+    let api_key = self_.get_api_key()?;
+
+    let stream = data.stream;
+
+    let url = match self_.model().supports_vision() {
+        true => CHAT_COMPLETIONS_API_URL_VL,
+        false => CHAT_COMPLETIONS_API_URL,
+    };
+
+    let (body, has_upload) = build_chat_completions_body(data, &self_.model)?;
+
+    let mut request_data = RequestData::new(url, body);
+
+    request_data.bearer_auth(api_key);
+
+    if stream {
+        request_data.header("X-DashScope-SSE", "enable");
+    }
+    if has_upload {
+        request_data.header("X-DashScope-OssResourceResolve", "enable");
+    }
+
+    Ok(request_data)
+}
+
+fn prepare_embeddings(self_: &QianwenClient, data: EmbeddingsData) -> Result<RequestData> {
+    let api_key = self_.get_api_key()?;
+
+    let text_type = match data.query {
+        true => "query",
+        false => "document",
+    };
+
+    let body = json!({
+        "model": self_.model.name(),
+        "input": {
+            "texts": data.texts,
+        },
+        "parameters": {
+            "text_type": text_type,
+        }
+    });
+
+    let mut request_data = RequestData::new(EMBEDDINGS_API_URL, body);
+
+    request_data.bearer_auth(api_key);
+
+    Ok(request_data)
 }
 
 async fn chat_completions(builder: RequestBuilder, model: &Model) -> Result<ChatCompletionsOutput> {
@@ -156,23 +152,21 @@ async fn chat_completions_streaming(
         debug!("stream-data: {data}");
         if model_name == "qwen-long" {
             if let Some(text) = data["output"]["choices"][0]["message"]["content"].as_str() {
-                let delta_text = &text[prev_text.len()..];
-                prev_text = text.to_string();
-                handler.text(delta_text)?;
+                handler.text(text)?;
             }
         } else if model.supports_vision() {
             if let Some(text) =
                 data["output"]["choices"][0]["message"]["content"][0]["text"].as_str()
             {
-                let delta_text = &text[prev_text.len()..];
-                prev_text = text.to_string();
-                handler.text(delta_text)?;
+                handler.text(text)?;
             }
         } else if let Some(text) = data["output"]["text"].as_str() {
             if let Some(pos) = text.rfind("✿FUNCTION") {
                 if pos > prev_text.len() {
                     let delta_text = &text[prev_text.len()..pos];
-                    handler.text(delta_text)?;
+                    if delta_text != ": \n" {
+                        handler.text(delta_text)?;
+                    }
                 }
                 prev_text = text.to_string();
                 if let Some((name, arguments)) = parse_tool_call(&text[pos..]) {
@@ -182,7 +176,10 @@ async fn chat_completions_streaming(
                     handler.tool_call(ToolCall::new(name.to_string(), arguments, None))?;
                 }
             } else {
-                let delta_text = &text[prev_text.len()..];
+                let mut delta_text = &text[prev_text.len()..];
+                if prev_text.is_empty() && delta_text.starts_with(": ") {
+                    delta_text = &delta_text[2..];
+                }
                 prev_text = text.to_string();
                 handler.text(delta_text)?;
             }
@@ -199,7 +196,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         temperature,
         top_p,
         functions,
-        stream: _,
+        stream,
     } = data;
 
     let mut has_upload = false;
@@ -236,11 +233,12 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
             "messages": messages,
         })
     } else {
-        let messages: Vec<Value> = messages
-            .into_iter()
-            .flat_map(|message| {
-                let role = message.role;
-                match message.content {
+        let messages: Vec<Value> =
+            messages
+                .into_iter()
+                .flat_map(|message| {
+                    let role = message.role;
+                    match message.content {
                     MessageContent::Text(text) => vec![json!({ "role": role, "content": text })],
                     MessageContent::Array(list) => {
                         let parts: Vec<_> = list
@@ -260,36 +258,40 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         vec![json!({ "role": role, "content": parts })]
                     }
                     MessageContent::ToolResults((tool_results, _)) => {
-                        let content = tool_results
-                            .iter()
-                            .map(|tool_result| {
-                                format!(
-                                    "✿FUNCTION✿: {}\n✿ARGS✿: {}\n✿RESULT✿",
-                                    tool_result.call.name, tool_result.call.arguments
-                                )
-                            })
-                            .collect::<Vec<String>>()
-                            .join("\n");
-                        let mut messages =
-                            vec![json!({ "role": MessageRole::Assistant, "content": content })];
-                        for tool_result in tool_results {
-                            messages.push(json!({
+                        tool_results.into_iter().flat_map(|tool_result| vec![
+                            json!({
+                                "role": MessageRole::Assistant,
+                                "content": "",
+                                "tool_calls": vec![
+                                    json!({
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_result.call.name,
+                                            "arguments": tool_result.call.arguments.to_string(),
+                                        },
+                                    })
+                                ],
+                            }),
+                            json!({
                                 "role": "tool",
                                 "content": tool_result.output.to_string(),
                                 "name": tool_result.call.name,
-                            }));
-                        }
-                        messages
+                            }),
+                        ]).collect()
                     }
                 }
-            })
-            .collect();
+                })
+                .collect();
         json!({
             "messages": messages,
         })
     };
 
     let mut parameters = json!({});
+
+    if stream && (model.name() == "qwen-long" || model.supports_vision()) {
+        parameters["incremental_output"] = true.into();
+    }
 
     if let Some(v) = model.max_tokens_param() {
         parameters["max_tokens"] = v.into();
@@ -322,7 +324,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
     Ok((body, has_upload))
 }
 
-async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let data: Value = builder.send().await?.json().await?;
     maybe_catch_error(&data)?;
     let res_body: EmbeddingsResBody =

@@ -1,7 +1,7 @@
 use super::*;
 
 use anyhow::{bail, Context, Result};
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -13,7 +13,7 @@ pub struct ClaudeConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patches: Option<ModelPatches>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -22,38 +22,41 @@ impl ClaudeClient {
 
     pub const PROMPTS: [PromptAction<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
-
-    fn chat_completions_builder(
-        &self,
-        client: &ReqwestClient,
-        data: ChatCompletionsData,
-    ) -> Result<RequestBuilder> {
-        let api_key = self.get_api_key().ok();
-
-        let mut body = claude_build_chat_completions_body(data, &self.model)?;
-        self.patch_chat_completions_body(&mut body);
-
-        let url = API_BASE;
-
-        debug!("Claude Request: {url} {body}");
-
-        let mut builder = client.post(url).json(&body);
-        builder = builder.header("anthropic-version", "2023-06-01");
-        if let Some(api_key) = api_key {
-            builder = builder.header("x-api-key", api_key)
-        }
-
-        Ok(builder)
-    }
 }
 
 impl_client_trait!(
     ClaudeClient,
-    claude_chat_completions,
-    claude_chat_completions_streaming
+    (
+        prepare_chat_completions,
+        claude_chat_completions,
+        claude_chat_completions_streaming
+    ),
+    (noop_prepare_embeddings, noop_embeddings),
+    (noop_prepare_rerank, noop_rerank),
 );
 
-pub async fn claude_chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
+fn prepare_chat_completions(
+    self_: &ClaudeClient,
+    data: ChatCompletionsData,
+) -> Result<RequestData> {
+    let api_key = self_.get_api_key().ok();
+
+    let body = claude_build_chat_completions_body(data, &self_.model)?;
+
+    let mut request_data = RequestData::new(API_BASE, body);
+
+    request_data.header("anthropic-version", "2023-06-01");
+    if let Some(api_key) = api_key {
+        request_data.header("x-api-key", api_key)
+    }
+
+    Ok(request_data)
+}
+
+pub async fn claude_chat_completions(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -67,6 +70,7 @@ pub async fn claude_chat_completions(builder: RequestBuilder) -> Result<ChatComp
 pub async fn claude_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
+    _model: &Model,
 ) -> Result<()> {
     let mut function_name = String::new();
     let mut function_arguments = String::new();

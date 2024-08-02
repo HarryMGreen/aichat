@@ -1,10 +1,6 @@
 use super::*;
 
-use crate::{
-    client::{Message, MessageContent, MessageRole, Model},
-    function::{FunctionsFilter, SELECTED_ALL_FUNCTIONS},
-    utils::{detect_os, detect_shell},
-};
+use crate::client::{Message, MessageContent, MessageRole, Model};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -21,11 +17,11 @@ pub trait RoleLike {
     fn model_mut(&mut self) -> &mut Model;
     fn temperature(&self) -> Option<f64>;
     fn top_p(&self) -> Option<f64>;
-    fn functions_filter(&self) -> Option<FunctionsFilter>;
+    fn use_tools(&self) -> Option<String>;
     fn set_model(&mut self, model: &Model);
     fn set_temperature(&mut self, value: Option<f64>);
     fn set_top_p(&mut self, value: Option<f64>);
-    fn set_functions_filter(&mut self, value: Option<FunctionsFilter>);
+    fn set_use_tools(&mut self, value: Option<String>);
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -43,7 +39,7 @@ pub struct Role {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    functions_filter: Option<FunctionsFilter>,
+    use_tools: Option<String>,
 
     #[serde(skip)]
     model: Model,
@@ -85,17 +81,13 @@ async function timeout(ms) {
                 .into(),
                 None,
             ),
-            (
-                "%functions%",
-                String::new(),
-                Some(SELECTED_ALL_FUNCTIONS.into()),
-            ),
+            ("%functions%", String::new(), Some("all".into())),
         ]
         .into_iter()
-        .map(|(name, prompt, functions_filter)| Self {
+        .map(|(name, prompt, use_tools)| Self {
             name: name.into(),
             prompt,
-            functions_filter,
+            use_tools,
             ..Default::default()
         })
         .collect()
@@ -111,8 +103,8 @@ async function timeout(ms) {
         let model = role_like.model();
         let temperature = role_like.temperature();
         let top_p = role_like.top_p();
-        let functions_filter = role_like.functions_filter();
-        self.batch_set(model, temperature, top_p, functions_filter);
+        let use_tools = role_like.use_tools();
+        self.batch_set(model, temperature, top_p, use_tools);
     }
 
     pub fn batch_set(
@@ -120,7 +112,7 @@ async function timeout(ms) {
         model: &Model,
         temperature: Option<f64>,
         top_p: Option<f64>,
-        functions_filter: Option<FunctionsFilter>,
+        use_tools: Option<String>,
     ) {
         self.set_model(model);
         if temperature.is_some() {
@@ -129,8 +121,8 @@ async function timeout(ms) {
         if top_p.is_some() {
             self.set_top_p(top_p);
         }
-        if functions_filter.is_some() {
-            self.set_functions_filter(functions_filter);
+        if use_tools.is_some() {
+            self.set_use_tools(use_tools);
         }
     }
 
@@ -242,8 +234,8 @@ impl RoleLike for Role {
         self.top_p
     }
 
-    fn functions_filter(&self) -> Option<FunctionsFilter> {
-        self.functions_filter.clone()
+    fn use_tools(&self) -> Option<String> {
+        self.use_tools.clone()
     }
 
     fn set_model(&mut self, model: &Model) {
@@ -258,8 +250,8 @@ impl RoleLike for Role {
         self.top_p = value;
     }
 
-    fn set_functions_filter(&mut self, value: Option<FunctionsFilter>) {
-        self.functions_filter = value;
+    fn set_use_tools(&mut self, value: Option<String>) {
+        self.use_tools = value;
     }
 }
 
@@ -320,17 +312,17 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
 }
 
 fn shell_prompt() -> String {
-    let os = detect_os();
-    let shell = detect_shell();
-    let shell = shell.name.as_str();
+    let os = OS.as_str();
+    let shell = SHELL.name.as_str();
     let combinator = if shell == "powershell" {
-        "\nIf multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
+        "If multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
     } else {
-        "\nIf multiple steps required try to combine them together using '&&'.".to_string()
+        "If multiple steps required try to combine them together using '&&'.".to_string()
     };
     format!(
         r#"Provide only {shell} commands for {os} without any description.
-Ensure the output is a valid {shell} command. {combinator}
+Ensure the output is a valid {shell} command.
+{combinator}
 If there is a lack of details, provide most logical solution.
 Output plain text only, without any markdown formatting."#
     )

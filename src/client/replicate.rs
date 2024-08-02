@@ -2,7 +2,6 @@ use super::prompt_format::*;
 use super::*;
 
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,7 +15,7 @@ pub struct ReplicateConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patches: Option<ModelPatches>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -25,27 +24,9 @@ impl ReplicateClient {
 
     pub const PROMPTS: [PromptAction<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
-
-    fn chat_completions_builder(
-        &self,
-        client: &ReqwestClient,
-        data: ChatCompletionsData,
-        api_key: &str,
-    ) -> Result<RequestBuilder> {
-        let mut body = build_chat_completions_body(data, &self.model)?;
-        self.patch_chat_completions_body(&mut body);
-
-        let url = format!("{API_BASE}/models/{}/predictions", self.model.name());
-
-        debug!("Replicate Request: {url} {body}");
-
-        let builder = client.post(url).bearer_auth(api_key).json(&body);
-
-        Ok(builder)
-    }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl Client for ReplicateClient {
     client_common_fns!();
 
@@ -54,9 +35,9 @@ impl Client for ReplicateClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let api_key = self.get_api_key()?;
-        let builder = self.chat_completions_builder(client, data, &api_key)?;
-        chat_completions(client, builder, &api_key).await
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        chat_completions(builder, client, &self.get_api_key()?).await
     }
 
     async fn chat_completions_streaming_inner(
@@ -65,15 +46,32 @@ impl Client for ReplicateClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let api_key = self.get_api_key()?;
-        let builder = self.chat_completions_builder(client, data, &api_key)?;
-        chat_completions_streaming(client, builder, handler).await
+        let request_data = prepare_chat_completions(self, data)?;
+        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        chat_completions_streaming(builder, handler, client).await
     }
 }
 
+fn prepare_chat_completions(
+    self_: &ReplicateClient,
+    data: ChatCompletionsData,
+) -> Result<RequestData> {
+    let api_key = self_.get_api_key()?;
+
+    let url = format!("{API_BASE}/models/{}/predictions", self_.model.name());
+
+    let body = build_chat_completions_body(data, &self_.model)?;
+
+    let mut request_data = RequestData::new(url, body);
+
+    request_data.bearer_auth(api_key);
+
+    Ok(request_data)
+}
+
 async fn chat_completions(
-    client: &ReqwestClient,
     builder: RequestBuilder,
+    client: &ReqwestClient,
     api_key: &str,
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
@@ -106,9 +104,9 @@ async fn chat_completions(
 }
 
 async fn chat_completions_streaming(
-    client: &ReqwestClient,
     builder: RequestBuilder,
     handler: &mut SseHandler,
+    client: &ReqwestClient,
 ) -> Result<()> {
     let res = builder.send().await?;
     let status = res.status();
@@ -126,6 +124,9 @@ async fn chat_completions_streaming(
         if message.event == "done" {
             return Ok(true);
         }
+
+        debug!("stream-data: {}", message.data);
+
         handler.text(&message.data)?;
         Ok(false)
     };

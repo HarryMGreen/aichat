@@ -1,7 +1,7 @@
 use super::*;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::{Client as ReqwestClient, RequestBuilder};
+use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -14,7 +14,7 @@ pub struct CloudflareConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patches: Option<ModelPatches>,
+    pub patch: Option<RequestPatch>,
     pub extra: Option<ExtraConfig>,
 }
 
@@ -26,63 +26,64 @@ impl CloudflareClient {
         ("account_id", "Account ID:", true, PromptKind::String),
         ("api_key", "API Key:", true, PromptKind::String),
     ];
-
-    fn chat_completions_builder(
-        &self,
-        client: &ReqwestClient,
-        data: ChatCompletionsData,
-    ) -> Result<RequestBuilder> {
-        let account_id = self.get_account_id()?;
-        let api_key = self.get_api_key()?;
-
-        let mut body = build_chat_completions_body(data, &self.model)?;
-        self.patch_chat_completions_body(&mut body);
-
-        let url = format!(
-            "{API_BASE}/accounts/{account_id}/ai/run/{}",
-            self.model.name()
-        );
-
-        debug!("Cloudflare Chat Completions Request: {url} {body}");
-
-        let builder = client.post(url).bearer_auth(api_key).json(&body);
-
-        Ok(builder)
-    }
-
-    fn embeddings_builder(
-        &self,
-        client: &ReqwestClient,
-        data: EmbeddingsData,
-    ) -> Result<RequestBuilder> {
-        let account_id = self.get_account_id()?;
-        let api_key = self.get_api_key()?;
-
-        let body = json!({
-            "text": data.texts,
-        });
-
-        let url = format!(
-            "{API_BASE}/accounts/{account_id}/ai/run/{}",
-            self.model.name()
-        );
-
-        debug!("Cloudflare Embeddings Request: {url} {body}");
-
-        let builder = client.post(url).bearer_auth(api_key).json(&body);
-
-        Ok(builder)
-    }
 }
 
 impl_client_trait!(
     CloudflareClient,
-    chat_completions,
-    chat_completions_streaming,
-    embeddings
+    (
+        prepare_chat_completions,
+        chat_completions,
+        chat_completions_streaming
+    ),
+    (prepare_embeddings, embeddings),
+    (noop_prepare_rerank, noop_rerank),
 );
 
-async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutput> {
+fn prepare_chat_completions(
+    self_: &CloudflareClient,
+    data: ChatCompletionsData,
+) -> Result<RequestData> {
+    let account_id = self_.get_account_id()?;
+    let api_key = self_.get_api_key()?;
+
+    let url = format!(
+        "{API_BASE}/accounts/{account_id}/ai/run/{}",
+        self_.model.name()
+    );
+
+    let body = build_chat_completions_body(data, &self_.model)?;
+
+    let mut request_data = RequestData::new(url, body);
+
+    request_data.bearer_auth(api_key);
+
+    Ok(request_data)
+}
+
+fn prepare_embeddings(self_: &CloudflareClient, data: EmbeddingsData) -> Result<RequestData> {
+    let account_id = self_.get_account_id()?;
+    let api_key = self_.get_api_key()?;
+
+    let url = format!(
+        "{API_BASE}/accounts/{account_id}/ai/run/{}",
+        self_.model.name()
+    );
+
+    let body = json!({
+        "text": data.texts,
+    });
+
+    let mut request_data = RequestData::new(url, body);
+
+    request_data.bearer_auth(api_key);
+
+    Ok(request_data)
+}
+
+async fn chat_completions(
+    builder: RequestBuilder,
+    _model: &Model,
+) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
@@ -97,6 +98,7 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
+    _model: &Model,
 ) -> Result<()> {
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
@@ -112,7 +114,7 @@ async fn chat_completions_streaming(
     sse_stream(builder, handle).await
 }
 
-async fn embeddings(builder: RequestBuilder) -> Result<EmbeddingsOutput> {
+async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<EmbeddingsOutput> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
