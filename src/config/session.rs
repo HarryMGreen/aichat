@@ -9,7 +9,7 @@ use inquire::{validator::Validation, Confirm, Text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs::{self, read_to_string};
+use std::fs::{read_to_string, write};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -51,15 +51,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: &Config, name: &str) -> Self {
-        let save_session = if name == TEMP_SESSION_NAME {
-            None
-        } else {
-            config.save_session
-        };
         let role = config.extract_role();
         let mut session = Self {
             name: name.to_string(),
-            save_session,
+            save_session: config.save_session,
             ..Default::default()
         };
         session.set_role(role);
@@ -84,10 +79,6 @@ impl Session {
         }
 
         Ok(session)
-    }
-
-    pub fn is_temp(&self) -> bool {
-        self.name == TEMP_SESSION_NAME
     }
 
     pub fn is_empty(&self) -> bool {
@@ -192,8 +183,9 @@ impl Session {
             .map(|(name, value)| format!("{name:<20}{value}"))
             .collect();
 
+        lines.push(String::new());
+
         if !self.is_empty() {
-            lines.push("".into());
             let resolve_url_fn = |url: &str| resolve_data_url(&self.data_urls, url.to_string());
 
             for message in &self.messages {
@@ -218,12 +210,7 @@ impl Session {
             }
         }
 
-        if lines.last() == Some(&String::new()) {
-            lines.pop();
-        }
-
-        let output = lines.join("\n");
-        Ok(output)
+        Ok(lines.join("\n"))
     }
 
     pub fn tokens_usage(&self) -> (usize, f32) {
@@ -302,6 +289,7 @@ impl Session {
     pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
         let save_session = self.save_session();
         if self.dirty && save_session != Some(false) {
+            let mut session_name = self.name().to_string();
             if save_session.is_none() {
                 if !is_repl {
                     return Ok(());
@@ -310,8 +298,8 @@ impl Session {
                 if !ans {
                     return Ok(());
                 }
-                if self.is_temp() {
-                    self.name = Text::new("Session name:")
+                while session_name == TEMP_SESSION_NAME {
+                    session_name = Text::new("Session name:")
                         .with_validator(|input: &str| {
                             if input.trim().is_empty() {
                                 Ok(Validation::Invalid("This field is required".into()))
@@ -321,21 +309,25 @@ impl Session {
                         })
                         .prompt()?;
                 }
+            } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
+                let now = chrono::Local::now();
+                let formatted_time = now.format("%Y%m%dT%H:%M:%S").to_string();
+                session_name = format!("{TEMP_SESSION_NAME}-{formatted_time}");
             }
-            let session_path = session_dir.join(format!("{}.yaml", self.name()));
-            self.save(&session_path, is_repl)?;
+            let session_path = session_dir.join(format!("{session_name}.yaml"));
+            self.save(&session_name, &session_path, is_repl)?;
         }
         Ok(())
     }
 
-    pub fn save(&mut self, session_path: &Path, is_repl: bool) -> Result<()> {
+    pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
         ensure_parent_exists(session_path)?;
 
         self.path = Some(session_path.display().to_string());
 
         let content = serde_yaml::to_string(&self)
             .with_context(|| format!("Failed to serde session {}", self.name))?;
-        fs::write(session_path, content).with_context(|| {
+        write(session_path, content).with_context(|| {
             format!(
                 "Failed to write session {} to {}",
                 self.name,
@@ -345,6 +337,10 @@ impl Session {
 
         if is_repl {
             println!("✨ Saved session to '{}'", session_path.display());
+        }
+
+        if self.name() != session_name {
+            self.name = session_name.to_string()
         }
 
         self.dirty = false;

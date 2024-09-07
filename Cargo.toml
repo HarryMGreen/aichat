@@ -1,6 +1,6 @@
 [package]
 name = "aichat"
-version = "0.20.0"
+version = "0.21.1"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one AI CLI Tool"
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 homepage = "https://github.com/sigoden/aichat"
 repository = "https://github.com/sigoden/aichat"
 categories = ["command-line-utilities"]
-keywords = ["chatgpt", "llm", "cli", "gpt", "repl"]
+keywords = ["chatgpt", "llm", "cli", "ai", "repl"]
 
 [dependencies]
 anyhow = "1.0.69"
@@ -18,7 +18,7 @@ dirs = "5.0.0"
 futures-util = "0.3.29"
 inquire = "0.7.0"
 is-terminal = "0.4.9"
-reedline = "0.33.0"
+reedline = "0.34.0"
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
@@ -60,6 +60,7 @@ hnsw_rs = "0.3.0"
 rayon = "1.10.0"
 uuid = { version = "1.9.1", features = ["v4"] }
 html2text = "0.12.5"
+scraper = { version = "0.20.0", default-features = false, features = ["deterministic"] }
 sys-locale = "0.3.1"
 
 [dependencies.reqwest]

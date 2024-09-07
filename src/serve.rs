@@ -1,4 +1,4 @@
-use crate::{client::*, config::*, utils::*};
+use crate::{client::*, config::*, function::*, rag::*, utils::*};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -14,7 +14,14 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{convert::Infallible, net::IpAddr, sync::Arc};
+use std::{
+    convert::Infallible,
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -58,20 +65,18 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
 }
 
 struct Server {
-    clients: Vec<ClientConfig>,
-    model: Model,
+    config: Config,
     models: Vec<Value>,
     roles: Vec<Role>,
+    rags: Vec<String>,
 }
 
 impl Server {
     fn new(config: &GlobalConfig) -> Self {
-        let config = config.read();
-        let clients = config.clients.clone();
-        let model = config.model.clone();
-        let roles = config.roles.clone();
+        let mut config = config.read().clone();
+        config.functions = Functions::default();
         let mut models = list_models(&config);
-        let mut default_model = model.clone();
+        let mut default_model = config.model.clone();
         default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
         models.insert(0, &default_model);
         let models: Vec<Value> = models
@@ -94,12 +99,13 @@ impl Server {
             })
             .collect();
         Self {
-            clients,
-            model,
-            roles,
+            config,
             models,
+            roles: Config::all_roles(),
+            rags: Config::list_rags(),
         }
     }
+
     async fn run(self: Arc<Self>, listener: TcpListener) -> Result<oneshot::Sender<()>> {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -157,6 +163,10 @@ impl Server {
             self.list_models()
         } else if path == "/v1/roles" {
             self.list_roles()
+        } else if path == "/v1/rags" {
+            self.list_rags()
+        } else if path == "/v1/rags/search" {
+            self.search_rag(req).await
         } else if path == "/playground" || path == "/playground.html" {
             self.playground_page()
         } else if path == "/arena" || path == "/arena.html" {
@@ -213,6 +223,43 @@ impl Server {
         Ok(res)
     }
 
+    fn list_rags(&self) -> Result<AppResponse> {
+        let data = json!({ "data": self.rags });
+        let res = Response::builder()
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(Full::new(Bytes::from(data.to_string())).boxed())?;
+        Ok(res)
+    }
+
+    async fn search_rag(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
+        let req_body = req.collect().await?.to_bytes();
+        let req_body: Value = serde_json::from_slice(&req_body)
+            .map_err(|err| anyhow!("Invalid request json, {err}"))?;
+
+        debug!("search rag request: {req_body}");
+        let SearchRagReqBody { name, input } = serde_json::from_value(req_body)
+            .map_err(|err| anyhow!("Invalid request body, {err}"))?;
+
+        let config = Arc::new(RwLock::new(self.config.clone()));
+
+        let abort_signal = create_abort_signal();
+
+        let rag = config
+            .read()
+            .rag_file(&name)
+            .ok()
+            .and_then(|rag_path| Rag::load(&config, &name, &rag_path).ok())
+            .ok_or_else(|| anyhow!("Invalid rag"))?;
+
+        let rag_result = Config::search_rag(&config, &rag, &input, abort_signal).await?;
+
+        let data = json!({ "data": rag_result });
+        let res = Response::builder()
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(Full::new(Bytes::from(data.to_string())).boxed())?;
+        Ok(res)
+    }
+
     async fn chat_completions(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
         let req_body = req.collect().await?.to_bytes();
         let req_body: Value = serde_json::from_slice(&req_body)
@@ -231,16 +278,15 @@ impl Server {
             stream,
         } = req_body;
 
-        let config = Config {
-            clients: self.clients.to_vec(),
-            model: self.model.clone(),
-            ..Default::default()
-        };
+        let config = self.config.clone();
+
+        let default_model = config.model.clone();
+
         let config = Arc::new(RwLock::new(config));
 
         let (model_name, change) = if model == DEFAULT_MODEL_NAME {
-            (self.model.id(), true)
-        } else if self.model.id() == model {
+            (default_model.id(), true)
+        } else if default_model.id() == model {
             (model, false)
         } else {
             (model, true)
@@ -254,7 +300,7 @@ impl Server {
         if max_tokens.is_some() {
             client.model_mut().set_max_tokens(max_tokens, true);
         }
-        let abort = create_abort_signal();
+        let abort_signal = create_abort_signal();
         let http_client = client.build_client()?;
 
         let completion_id = generate_completion_id();
@@ -271,18 +317,18 @@ impl Server {
         if stream {
             let (tx, mut rx) = unbounded_channel();
             tokio::spawn(async move {
-                let mut is_first = true;
-                let (tx2, rx2) = unbounded_channel();
-                let mut handler = SseHandler::new(tx2, abort);
+                let is_first = Arc::new(AtomicBool::new(true));
+                let (sse_tx, sse_rx) = unbounded_channel();
+                let mut handler = SseHandler::new(sse_tx, abort_signal);
                 async fn map_event(
-                    mut rx: UnboundedReceiver<SseEvent>,
+                    mut sse_rx: UnboundedReceiver<SseEvent>,
                     tx: &UnboundedSender<ResEvent>,
-                    is_first: &mut bool,
+                    is_first: Arc<AtomicBool>,
                 ) {
-                    while let Some(reply_event) = rx.recv().await {
-                        if *is_first {
+                    while let Some(reply_event) = sse_rx.recv().await {
+                        if is_first.load(Ordering::SeqCst) {
                             let _ = tx.send(ResEvent::First(None));
-                            *is_first = false;
+                            is_first.store(false, Ordering::SeqCst)
                         }
                         match reply_event {
                             SseEvent::Text(text) => {
@@ -290,19 +336,41 @@ impl Server {
                             }
                             SseEvent::Done => {
                                 let _ = tx.send(ResEvent::Done);
+                                sse_rx.close();
                             }
                         }
                     }
                 }
-                tokio::select! {
-                    _ = map_event(rx2, &tx, &mut is_first) => {}
-                    ret = client.chat_completions_streaming_inner(&http_client, &mut handler, data) => {
-                        if let Err(err) = ret {
-                            send_first_event(&tx, Some(format!("{err:?}")), &mut is_first)
+                async fn chat_completions(
+                    client: &dyn Client,
+                    http_client: &reqwest::Client,
+                    handler: &mut SseHandler,
+                    data: ChatCompletionsData,
+                    tx: &UnboundedSender<ResEvent>,
+                    is_first: Arc<AtomicBool>,
+                ) {
+                    let ret = client
+                        .chat_completions_streaming_inner(http_client, handler, data)
+                        .await;
+                    if let Err(err) = ret {
+                        if is_first.load(Ordering::SeqCst) {
+                            let _ = tx.send(ResEvent::First(Some(format!("{err:?}"))));
+                            is_first.store(false, Ordering::SeqCst)
                         }
-                        let _ = tx.send(ResEvent::Done);
                     }
+                    let _ = handler.done();
                 }
+                tokio::join!(
+                    map_event(sse_rx, &tx, is_first.clone()),
+                    chat_completions(
+                        client.as_ref(),
+                        &http_client,
+                        &mut handler,
+                        data,
+                        &tx,
+                        is_first
+                    ),
+                );
             });
 
             let first_event = rx.recv().await;
@@ -370,11 +438,8 @@ impl Server {
             model: embedding_model_id,
         } = req_body;
 
-        let config = Config {
-            clients: self.clients.to_vec(),
-            ..Default::default()
-        };
-        let config = Arc::new(RwLock::new(config));
+        let config = Arc::new(RwLock::new(self.config.clone()));
+
         let embedding_model = Model::retrieve_embedding(&config.read(), &embedding_model_id)?;
 
         let texts = match input {
@@ -416,6 +481,12 @@ impl Server {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchRagReqBody {
+    name: String,
+    input: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatCompletionsReqBody {
     model: String,
     messages: Vec<Message>,
@@ -444,13 +515,6 @@ enum ResEvent {
     First(Option<String>),
     Text(String),
     Done,
-}
-
-fn send_first_event(tx: &UnboundedSender<ResEvent>, data: Option<String>, is_first: &mut bool) {
-    if *is_first {
-        let _ = tx.send(ResEvent::First(data));
-        *is_first = false;
-    }
 }
 
 async fn shutdown_signal() {

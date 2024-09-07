@@ -11,7 +11,6 @@ pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
-    pub chat_endpoint: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
     pub patch: Option<RequestPatch>,
@@ -36,7 +35,6 @@ impl OpenAICompatibleClient {
     ];
 }
 
-
 impl_client_trait!(
     OpenAICompatibleClient,
     (
@@ -55,13 +53,7 @@ fn prepare_chat_completions(
     let api_key = self_.get_api_key().ok();
     let api_base = get_api_base_ext(self_)?;
 
-    let chat_endpoint = self_
-        .config
-        .chat_endpoint
-        .as_deref()
-        .unwrap_or("/chat/completions");
-
-    let url = format!("{api_base}{chat_endpoint}");
+    let url = format!("{api_base}/chat/completions");
 
     let body = openai_build_chat_completions_body(data, &self_.model);
 
@@ -126,7 +118,7 @@ fn get_api_base_ext(self_: &OpenAICompatibleClient) -> Result<String> {
             }
         }
     };
-    Ok(api_base)
+    Ok(api_base.trim_end_matches('/').to_string())
 }
 
 pub async fn generic_rerank(builder: RequestBuilder, _model: &Model) -> Result<RerankOutput> {

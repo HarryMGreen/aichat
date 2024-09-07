@@ -157,19 +157,15 @@ impl Model {
             }
             "embedding" => {
                 let ModelData {
-                    max_input_tokens,
                     input_price,
-                    output_vector_size,
+                    max_tokens_per_chunk,
                     max_batch_size,
                     ..
                 } = &self.data;
-                let dimension = format_option_value(output_vector_size);
-                let max_tokens = format_option_value(max_input_tokens);
+                let max_tokens = format_option_value(max_tokens_per_chunk);
+                let max_batch = format_option_value(max_batch_size);
                 let price = format_option_value(input_price);
-                let batch = format_option_value(max_batch_size);
-                format!(
-                    "dimension:{dimension}; max-tokens:{max_tokens}; price:{price}; batch:{batch}"
-                )
+                format!("max-tokens:{max_tokens};max-batch:{max_batch};price:{price}")
             }
             _ => String::new(),
         }
@@ -187,16 +183,16 @@ impl Model {
         self.data.supports_vision
     }
 
-    pub fn supports_function_calling(&self) -> bool {
-        self.data.supports_function_calling
+    pub fn max_tokens_per_chunk(&self) -> Option<usize> {
+        self.data.max_tokens_per_chunk
     }
 
     pub fn default_chunk_size(&self) -> usize {
         self.data.default_chunk_size.unwrap_or(1000)
     }
 
-    pub fn max_batch_size(&self) -> usize {
-        self.data.max_batch_size.unwrap_or(1)
+    pub fn max_batch_size(&self) -> Option<usize> {
+        self.data.max_batch_size
     }
 
     pub fn max_tokens_param(&self) -> Option<isize> {
@@ -274,7 +270,7 @@ pub struct ModelData {
     pub supports_function_calling: bool,
 
     // embedding-only properties
-    pub output_vector_size: Option<usize>,
+    pub max_tokens_per_chunk: Option<usize>,
     pub default_chunk_size: Option<usize>,
     pub max_batch_size: Option<usize>,
 }

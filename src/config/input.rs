@@ -72,7 +72,7 @@ impl Input {
             texts.push(String::new());
         }
         for (path, contents) in files {
-            texts.push(format!("<!-- include: {path} -->\n\n{contents}\n"));
+            texts.push(format!("`{path}`:\n\n{contents}\n"));
         }
         let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Ok(Self {
@@ -145,36 +145,9 @@ impl Input {
         if !self.text.is_empty() {
             let rag = self.config.read().rag.clone();
             if let Some(rag) = rag {
-                let (top_k, min_score_vector_search, min_score_keyword_search) = {
-                    let config = self.config.read();
-                    (
-                        config.rag_top_k,
-                        config.rag_min_score_vector_search,
-                        config.rag_min_score_keyword_search,
-                    )
-                };
-                let rerank = match self.config.read().rag_reranker_model.clone() {
-                    Some(reranker_model_id) => {
-                        let min_score = self.config.read().rag_min_score_rerank;
-                        let rerank_model =
-                            Model::retrieve_reranker(&self.config.read(), &reranker_model_id)?;
-                        let rerank_client = init_client(&self.config, Some(rerank_model))?;
-                        Some((rerank_client, min_score))
-                    }
-                    None => None,
-                };
-                let embeddings = rag
-                    .search(
-                        &self.text,
-                        top_k,
-                        min_score_vector_search,
-                        min_score_keyword_search,
-                        rerank,
-                        abort_signal,
-                    )
-                    .await?;
-                let text = self.config.read().rag_template(&embeddings, &self.text);
-                self.patched_text = Some(text);
+                let result =
+                    Config::search_rag(&self.config, &rag, &self.text, abort_signal).await?;
+                self.patched_text = Some(result);
                 self.rag_name = Some(rag.name().to_string());
             }
         }
@@ -212,7 +185,7 @@ impl Input {
         model.guard_max_input_tokens(&messages)?;
         let temperature = self.role().temperature();
         let top_p = self.role().top_p();
-        let functions = self.config.read().select_functions(model, self.role());
+        let functions = self.config.read().select_functions(self.role());
         Ok(ChatCompletionsData {
             messages,
             temperature,

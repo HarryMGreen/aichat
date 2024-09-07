@@ -5,12 +5,12 @@ mod session;
 
 pub use self::agent::{list_agents, Agent};
 pub use self::input::Input;
-pub use self::role::{Role, RoleLike, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
+pub use self::role::{Role, RoleLike, BUILTIN_ROLES, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
 use self::session::Session;
 
 use crate::client::{
-    create_client_config, list_chat_models, list_client_types, list_reranker_models, ClientConfig,
-    Model, OPENAI_COMPATIBLE_PLATFORMS,
+    create_client_config, init_client, list_chat_models, list_client_types, list_reranker_models,
+    ClientConfig, Model, OPENAI_COMPATIBLE_PLATFORMS,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -19,7 +19,7 @@ use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
-use inquire::{Confirm, Select};
+use inquire::{validator::Validation, Confirm, Select, Text};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::json;
@@ -40,7 +40,7 @@ const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bi
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
-const ROLES_FILE_NAME: &str = "roles.yaml";
+const ROLES_DIR_NAME: &str = "roles";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
@@ -129,8 +129,6 @@ pub struct Config {
     pub clients: Vec<ClientConfig>,
 
     #[serde(skip)]
-    pub roles: Vec<Role>,
-    #[serde(skip)]
     pub role: Option<Role>,
     #[serde(skip)]
     pub session: Option<Session>,
@@ -195,7 +193,6 @@ impl Default for Config {
 
             clients: vec![],
 
-            roles: vec![],
             role: None,
             session: None,
             rag: None,
@@ -236,7 +233,6 @@ impl Config {
         }
 
         config.load_functions()?;
-        config.load_roles()?;
 
         config.setup_model()?;
         config.setup_document_loaders();
@@ -269,11 +265,15 @@ impl Config {
         }
     }
 
-    pub fn roles_file() -> Result<PathBuf> {
-        match env::var(get_env_name("roles_file")) {
+    pub fn roles_dir() -> Result<PathBuf> {
+        match env::var(get_env_name("roles_dir")) {
             Ok(value) => Ok(PathBuf::from(value)),
-            Err(_) => Self::local_path(ROLES_FILE_NAME),
+            Err(_) => Self::local_path(ROLES_DIR_NAME),
         }
+    }
+
+    pub fn role_file(name: &str) -> Result<PathBuf> {
+        Ok(Self::roles_dir()?.join(format!("{name}.md")))
     }
 
     pub fn env_file() -> Result<PathBuf> {
@@ -487,7 +487,7 @@ impl Config {
         } else if let Some(session) = &self.session {
             session.export()
         } else if let Some(role) = &self.role {
-            role.export()
+            Ok(role.export())
         } else if let Some(rag) = &self.rag {
             rag.export()
         } else {
@@ -531,7 +531,7 @@ impl Config {
             ("highlight", self.highlight.to_string()),
             ("light_theme", self.light_theme.to_string()),
             ("config_file", display_path(&Self::config_file()?)),
-            ("roles_file", display_path(&Self::roles_file()?)),
+            ("roles_dir", display_path(&Self::roles_dir()?)),
             ("env_file", display_path(&Self::env_file()?)),
             ("functions_dir", display_path(&Self::functions_dir()?)),
             ("rags_dir", display_path(&Self::rags_dir()?)),
@@ -543,9 +543,9 @@ impl Config {
         }
         let output = items
             .iter()
-            .map(|(name, value)| format!("{name:<24}{value}"))
+            .map(|(name, value)| format!("{name:<24}{value}\n"))
             .collect::<Vec<String>>()
-            .join("\n");
+            .join("");
         Ok(output)
     }
 
@@ -716,7 +716,7 @@ impl Config {
 
     pub fn role_info(&self) -> Result<String> {
         if let Some(role) = &self.role {
-            role.export()
+            Ok(role.export())
         } else {
             bail!("No role")
         }
@@ -733,27 +733,140 @@ impl Config {
     }
 
     pub fn retrieve_role(&self, name: &str) -> Result<Role> {
-        let mut role = self
-            .roles
-            .iter()
-            .find(|v| v.match_name(name))
-            .map(|v| {
-                let mut role = v.clone();
-                role.complete_prompt_args(name);
-                role
-            })
-            .ok_or_else(|| anyhow!("Unknown role `{name}`"))?;
-
+        let names = Self::list_roles(false);
+        let mut role = if let Some(role_name) = Role::match_name(&names, name) {
+            let path = Self::role_file(&role_name)?;
+            let content = read_to_string(&path)?;
+            Role::new(name, &content)
+        } else {
+            BUILTIN_ROLES
+                .iter()
+                .find(|v| v.name() == name)
+                .cloned()
+                .ok_or_else(|| anyhow!("Unknown role `{name}`"))?
+        };
         match role.model_id() {
             Some(model_id) => {
                 if self.model.id() != model_id {
                     let model = Model::retrieve_chat(self, model_id)?;
                     role.set_model(&model);
+                } else {
+                    role.set_model(&self.model);
                 }
             }
             None => role.set_model(&self.model),
         }
         Ok(role)
+    }
+
+    pub fn new_role(&mut self, name: &str) -> Result<()> {
+        let ans = Confirm::new("Create a new role?")
+            .with_default(true)
+            .prompt()?;
+        if ans {
+            self.upsert_role(name)?;
+        }
+        Ok(())
+    }
+
+    pub fn edit_role(&mut self) -> Result<()> {
+        if let Some(name) = self.role.as_ref().map(|v| v.name().to_string()) {
+            self.upsert_role(&name)
+        } else {
+            bail!("No role")
+        }
+    }
+
+    pub fn upsert_role(&mut self, name: &str) -> Result<()> {
+        let names = Self::list_roles(false);
+        let role_name = Role::match_name(&names, name).unwrap_or_else(|| name.to_string());
+        let role_path = Self::role_file(&role_name)?;
+        ensure_parent_exists(&role_path)?;
+        let editor = self.editor()?;
+        edit_file(&editor, &role_path)?;
+        self.use_role(name)?;
+        Ok(())
+    }
+
+    pub fn save_role(&mut self, name: Option<&str>) -> Result<()> {
+        let mut role_name = match &self.role {
+            Some(role) => match name {
+                Some(v) => v.to_string(),
+                None => role.name().to_string(),
+            },
+            None => bail!("No role"),
+        };
+        if role_name.contains('#') {
+            bail!("Unable to save role with arguments")
+        }
+        if role_name == TEMP_ROLE_NAME {
+            role_name = Text::new("Role name:")
+                .with_validator(|input: &str| {
+                    if input.trim().is_empty() {
+                        Ok(Validation::Invalid("This field is required".into()))
+                    } else {
+                        Ok(Validation::Valid)
+                    }
+                })
+                .prompt()?;
+        }
+        let role_path = Self::role_file(&role_name)?;
+        if let Some(role) = self.role.as_mut() {
+            let old_name = role.name().to_string();
+            role.save(&role_name, &role_path, self.working_mode.is_repl())?;
+            if old_name != role_name {
+                if let Ok(path) = Self::role_file(&old_name) {
+                    let _ = remove_file(&path);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn all_roles() -> Vec<Role> {
+        let mut roles: HashMap<String, Role> = BUILTIN_ROLES
+            .iter()
+            .map(|v| (v.name().to_string(), v.clone()))
+            .collect();
+        let names = Self::list_roles(false);
+        for name in names {
+            if let Ok(path) = Self::role_file(&name) {
+                if let Ok(content) = read_to_string(&path) {
+                    let role = Role::new(&name, &content);
+                    roles.insert(name, role);
+                }
+            }
+        }
+        let mut roles: Vec<_> = roles.into_values().collect();
+        roles.sort_unstable_by(|a, b| a.name().cmp(b.name()));
+        roles
+    }
+
+    pub fn list_roles(with_builtin: bool) -> Vec<String> {
+        let mut names = HashSet::new();
+        if let Some(rd) = Self::roles_dir().ok().and_then(|dir| read_dir(dir).ok()) {
+            for entry in rd.flatten() {
+                if let Some(name) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|v| v.strip_suffix(".md"))
+                {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        if with_builtin {
+            names.extend(BUILTIN_ROLES.iter().map(|v| v.name().to_string()));
+        }
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub fn has_role(name: &str) -> bool {
+        let names = Self::list_roles(true);
+        Role::match_name(&names, name).is_some()
     }
 
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
@@ -822,16 +935,22 @@ impl Config {
     }
 
     pub fn save_session(&mut self, name: Option<&str>) -> Result<()> {
-        let name = match &self.session {
+        let session_name = match &self.session {
             Some(session) => match name {
                 Some(v) => v.to_string(),
                 None => session.name().to_string(),
             },
             None => bail!("No session"),
         };
-        let session_path = self.session_file(&name)?;
+        let session_path = self.session_file(&session_name)?;
         if let Some(session) = self.session.as_mut() {
-            session.save(&session_path, self.working_mode.is_repl())?;
+            let old_name = session.name().to_string();
+            session.save(&session_name, &session_path, self.working_mode.is_repl())?;
+            if old_name != session_name {
+                if let Ok(path) = self.session_file(&old_name) {
+                    let _ = remove_file(&path);
+                }
+            }
         }
         Ok(())
     }
@@ -841,9 +960,9 @@ impl Config {
             Some(session) => session.name().to_string(),
             None => bail!("No session"),
         };
-        let editor = self.editor()?;
         let session_path = self.session_file(&name)?;
         self.save_session(Some(&name))?;
+        let editor = self.editor()?;
         edit_file(&editor, &session_path).with_context(|| {
             format!(
                 "Failed to edit '{}' with '{editor}'",
@@ -879,6 +998,9 @@ impl Config {
                 for entry in rd.flatten() {
                     let name = entry.file_name();
                     if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
+                        if name.starts_with(TEMP_SESSION_NAME) {
+                            continue;
+                        }
                         names.push(name.to_string());
                     }
                 }
@@ -980,7 +1102,44 @@ impl Config {
         Ok(())
     }
 
-    pub fn list_rags(&self) -> Vec<String> {
+    pub async fn search_rag(
+        config: &GlobalConfig,
+        rag: &Rag,
+        text: &str,
+        abort_signal: AbortSignal,
+    ) -> Result<String> {
+        let (top_k, min_score_vector_search, min_score_keyword_search) = {
+            let config = config.read();
+            (
+                config.rag_top_k,
+                config.rag_min_score_vector_search,
+                config.rag_min_score_keyword_search,
+            )
+        };
+        let rerank = match config.read().rag_reranker_model.clone() {
+            Some(reranker_model_id) => {
+                let min_score = config.read().rag_min_score_rerank;
+                let rerank_model = Model::retrieve_reranker(&config.read(), &reranker_model_id)?;
+                let rerank_client = init_client(config, Some(rerank_model))?;
+                Some((rerank_client, min_score))
+            }
+            None => None,
+        };
+        let embeddings = rag
+            .search(
+                text,
+                top_k,
+                min_score_vector_search,
+                min_score_keyword_search,
+                rerank,
+                abort_signal,
+            )
+            .await?;
+        let text = config.read().rag_template(&embeddings, text);
+        Ok(text)
+    }
+
+    pub fn list_rags() -> Vec<String> {
         let rags_dir = match Self::rags_dir() {
             Ok(dir) => dir,
             Err(_) => return vec![],
@@ -1114,7 +1273,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn select_functions(&self, model: &Model, role: &Role) -> Option<Vec<FunctionDeclaration>> {
+    pub fn select_functions(&self, role: &Role) -> Option<Vec<FunctionDeclaration>> {
         let mut functions = vec![];
         if self.function_calling {
             if let Some(use_tools) = role.use_tools() {
@@ -1174,12 +1333,6 @@ impl Config {
                 );
                 functions = agent_functions;
             }
-            if !functions.is_empty() && !model.supports_function_calling() {
-                functions.clear();
-                if *IS_STDOUT_TERMINAL {
-                    eprintln!("{}", warning_text("WARNING: This LLM or client does not support function calling, despite the context requiring it."));
-                }
-            }
         };
         if functions.is_empty() {
             None
@@ -1205,10 +1358,9 @@ impl Config {
         let mut filter = "";
         if args.len() == 1 {
             values = match cmd {
-                ".role" => self
-                    .roles
-                    .iter()
-                    .map(|v| (v.name().to_string(), None))
+                ".role" => Self::list_roles(true)
+                    .into_iter()
+                    .map(|v| (v, None))
                     .collect(),
                 ".model" => list_chat_models(self)
                     .into_iter()
@@ -1219,7 +1371,7 @@ impl Config {
                     .into_iter()
                     .map(|v| (v, None))
                     .collect(),
-                ".rag" => self.list_rags().into_iter().map(|v| (v, None)).collect(),
+                ".rag" => Self::list_rags().into_iter().map(|v| (v, None)).collect(),
                 ".agent" => list_agents().into_iter().map(|v| (v, None)).collect(),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
@@ -1700,28 +1852,6 @@ impl Config {
 
     fn load_functions(&mut self) -> Result<()> {
         self.functions = Functions::init(&Self::functions_file()?)?;
-        if self.functions.is_empty() {
-            self.function_calling = false;
-        }
-        Ok(())
-    }
-
-    fn load_roles(&mut self) -> Result<()> {
-        let path = Self::roles_file()?;
-        self.roles = if !path.exists() {
-            vec![]
-        } else {
-            let content = read_to_string(&path)
-                .with_context(|| format!("Failed to load roles at {}", path.display()))?;
-            serde_yaml::from_str(&content).with_context(|| "Invalid roles config")?
-        };
-        let exist_roles: HashSet<_> = self.roles.iter().map(|v| v.name().to_string()).collect();
-        let builtin_roles = Role::builtin();
-        for role in builtin_roles {
-            if !exist_roles.contains(role.name()) {
-                self.roles.push(role);
-            }
-        }
         Ok(())
     }
 
@@ -1740,16 +1870,12 @@ impl Config {
     }
 
     fn setup_document_loaders(&mut self) {
-        [
-            ("pdf", "pdftotext $1 -"),
-            ("docx", "pandoc --to plain $1"),
-            (RECURSIVE_URL_LOADER, "rag-crawler $1 $2"),
-        ]
-        .into_iter()
-        .for_each(|(k, v)| {
-            let (k, v) = (k.to_string(), v.to_string());
-            self.document_loaders.entry(k).or_insert(v);
-        });
+        [("pdf", "pdftotext $1 -"), ("docx", "pandoc --to plain $1")]
+            .into_iter()
+            .for_each(|(k, v)| {
+                let (k, v) = (k.to_string(), v.to_string());
+                self.document_loaders.entry(k).or_insert(v);
+            });
     }
 }
 

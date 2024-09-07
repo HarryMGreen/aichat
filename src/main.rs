@@ -78,11 +78,8 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     if cli.list_roles {
-        config
-            .read()
-            .roles
-            .iter()
-            .for_each(|v| println!("{}", v.name()));
+        let roles = Config::list_roles(true).join("\n");
+        println!("{roles}");
         return Ok(());
     }
     if cli.list_agents {
@@ -91,7 +88,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     if cli.list_rags {
-        let rags = config.read().list_rags().join("\n");
+        let rags = Config::list_rags().join("\n");
         println!("{rags}");
         return Ok(());
     }
@@ -198,8 +195,6 @@ async fn start_directive(
         .write()
         .after_chat_completion(&input, &output, &tool_results)?;
 
-    config.write().exit_session()?;
-
     if need_send_tool_results(&tool_results) {
         start_directive(
             config,
@@ -207,10 +202,11 @@ async fn start_directive(
             code_mode,
             abort_signal,
         )
-        .await
-    } else {
-        Ok(())
+        .await?;
     }
+
+    config.write().exit_session()?;
+    Ok(())
 }
 
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
