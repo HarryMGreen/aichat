@@ -2,21 +2,25 @@ mod abort_signal;
 mod clipboard;
 mod command;
 mod crypto;
+mod html_to_md;
 mod path;
 mod prompt_input;
 mod render_prompt;
 mod request;
 mod spinner;
+mod variables;
 
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;
 pub use self::command::*;
 pub use self::crypto::*;
+pub use self::html_to_md::*;
 pub use self::path::*;
 pub use self::prompt_input::*;
 pub use self::render_prompt::render_prompt;
 pub use self::request::*;
 pub use self::spinner::*;
+pub use self::variables::*;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;

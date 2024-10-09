@@ -233,6 +233,9 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
     config
         .write()
         .after_chat_completion(&input, &eval_str, &[])?;
+    if eval_str.is_empty() {
+        bail!("No command generated");
+    }
     if config.read().dry_run {
         config.read().print_markdown(&eval_str)?;
         return Ok(());
@@ -241,7 +244,7 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
         loop {
             let answer = Select::new(
                 eval_str.trim(),
-                vec!["✅ Execute", "🔄️ Revise", "📖 Explain", "❌ Cancel"],
+                vec!["✅ Execute", "🔄 Revise", "📖 Explain", "❌ Cancel"],
             )
             .prompt()?;
 
@@ -253,7 +256,7 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
                         process::exit(code);
                     }
                 }
-                "🔄️ Revise" => {
+                "🔄 Revise" => {
                     let revision = Text::new("Enter your revision:").prompt()?;
                     let text = format!("{}\n{revision}", input.text());
                     input.set_text(text);
@@ -269,6 +272,7 @@ async fn shell_execute(config: &GlobalConfig, shell: &Shell, mut input: Input) -
                     } else {
                         call_chat_completions(&input, client.as_ref(), config).await?;
                     }
+                    println!();
                     continue;
                 }
                 _ => {}
@@ -313,7 +317,7 @@ async fn create_input(
 }
 
 fn setup_logger(is_serve: bool) -> Result<()> {
-    let (log_level, log_path) = Config::log(is_serve)?;
+    let (log_level, log_path) = Config::log_config(is_serve)?;
     if log_level == LevelFilter::Off {
         return Ok(());
     }

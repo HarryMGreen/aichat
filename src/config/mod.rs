@@ -5,12 +5,12 @@ mod session;
 
 pub use self::agent::{list_agents, Agent};
 pub use self::input::Input;
-pub use self::role::{Role, RoleLike, BUILTIN_ROLES, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
+pub use self::role::{Role, RoleLike, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
 use self::session::Session;
 
 use crate::client::{
-    create_client_config, init_client, list_chat_models, list_client_types, list_reranker_models,
-    ClientConfig, Model, OPENAI_COMPATIBLE_PLATFORMS,
+    create_client_config, list_chat_models, list_client_types, list_reranker_models, ClientConfig,
+    Model, OPENAI_COMPATIBLE_PLATFORMS,
 };
 use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::rag::Rag;
@@ -19,7 +19,7 @@ use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
-use inquire::{validator::Validation, Confirm, Select, Text};
+use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,7 +27,9 @@ use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
 use std::{
     env,
-    fs::{create_dir_all, read_dir, read_to_string, remove_file, File, OpenOptions},
+    fs::{
+        create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
+    },
     io::Write,
     path::{Path, PathBuf},
     process,
@@ -56,6 +58,8 @@ pub const TEMP_RAG_NAME: &str = "temp";
 pub const TEMP_SESSION_NAME: &str = "temp";
 
 const CLIENTS_FIELD: &str = "clients";
+
+const SERVE_ADDR: &str = "127.0.0.1:8000";
 
 const SUMMARIZE_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
@@ -95,6 +99,10 @@ pub struct Config {
     pub wrap: Option<String>,
     pub wrap_code: bool,
 
+    pub function_calling: bool,
+    pub mapping_tools: IndexMap<String, String>,
+    pub use_tools: Option<String>,
+
     pub prelude: Option<String>,
     pub repl_prelude: Option<String>,
     pub agent_prelude: Option<String>,
@@ -104,10 +112,6 @@ pub struct Config {
     pub summarize_prompt: Option<String>,
     pub summary_prompt: Option<String>,
 
-    pub function_calling: bool,
-    pub mapping_tools: IndexMap<String, String>,
-    pub use_tools: Option<String>,
-
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
     pub rag_top_k: usize,
@@ -115,7 +119,6 @@ pub struct Config {
     pub rag_chunk_overlap: Option<usize>,
     pub rag_min_score_vector_search: f32,
     pub rag_min_score_keyword_search: f32,
-    pub rag_min_score_rerank: f32,
     pub rag_template: Option<String>,
 
     #[serde(default)]
@@ -125,6 +128,8 @@ pub struct Config {
     pub light_theme: bool,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
+
+    pub serve_addr: Option<String>,
 
     pub clients: Vec<ClientConfig>,
 
@@ -161,6 +166,10 @@ impl Default for Config {
             wrap: None,
             wrap_code: false,
 
+            function_calling: true,
+            mapping_tools: Default::default(),
+            use_tools: None,
+
             prelude: None,
             repl_prelude: None,
             agent_prelude: None,
@@ -170,10 +179,6 @@ impl Default for Config {
             summarize_prompt: None,
             summary_prompt: None,
 
-            function_calling: true,
-            mapping_tools: Default::default(),
-            use_tools: None,
-
             rag_embedding_model: None,
             rag_reranker_model: None,
             rag_top_k: 4,
@@ -181,7 +186,6 @@ impl Default for Config {
             rag_chunk_overlap: None,
             rag_min_score_vector_search: 0.0,
             rag_min_score_keyword_search: 0.0,
-            rag_min_score_rerank: 0.0,
             rag_template: None,
 
             document_loaders: Default::default(),
@@ -190,6 +194,8 @@ impl Default for Config {
             light_theme: false,
             left_prompt: None,
             right_prompt: None,
+
+            serve_addr: None,
 
             clients: vec![],
 
@@ -332,7 +338,7 @@ impl Config {
     pub fn rag_file(&self, name: &str) -> Result<PathBuf> {
         let path = match &self.agent {
             Some(agent) => Self::agent_rag_file(agent.name(), name)?,
-            None => Self::rags_dir()?.join(format!("{name}.bin")),
+            None => Self::rags_dir()?.join(format!("{name}.yaml")),
         };
         Ok(path)
     }
@@ -353,7 +359,7 @@ impl Config {
     }
 
     pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> Result<PathBuf> {
-        Ok(Self::agent_config_dir(agent_name)?.join(format!("{rag_name}.bin")))
+        Ok(Self::agent_config_dir(agent_name)?.join(format!("{rag_name}.yaml")))
     }
 
     pub fn agent_variables_file(name: &str) -> Result<PathBuf> {
@@ -392,7 +398,11 @@ impl Config {
         flags
     }
 
-    pub fn log(is_serve: bool) -> Result<(LevelFilter, Option<PathBuf>)> {
+    pub fn serve_addr(&self) -> String {
+        self.serve_addr.clone().unwrap_or_else(|| SERVE_ADDR.into())
+    }
+
+    pub fn log_config(is_serve: bool) -> Result<(LevelFilter, Option<PathBuf>)> {
         let log_level = env::var(get_env_name("log_level"))
             .ok()
             .and_then(|v| v.parse().ok())
@@ -455,7 +465,12 @@ impl Config {
             role.clone()
         } else {
             let mut role = Role::default();
-            role.batch_set(&self.model, self.temperature, self.top_p, None);
+            role.batch_set(
+                &self.model,
+                self.temperature,
+                self.top_p,
+                self.use_tools.clone(),
+            );
             role
         };
         if role.temperature().is_none() && self.temperature.is_some() {
@@ -463,9 +478,6 @@ impl Config {
         }
         if role.top_p().is_none() && self.top_p.is_some() {
             role.set_top_p(self.top_p);
-        }
-        if role.use_tools().is_none() && self.use_tools.is_some() {
-            role.set_use_tools(self.use_tools.clone())
         }
         role
     }
@@ -501,6 +513,14 @@ impl Config {
             .wrap
             .clone()
             .map_or_else(|| String::from("no"), |v| v.to_string());
+        let (rag_reranker_model, rag_top_k) = match &self.rag {
+            Some(rag) => rag.get_config(),
+            None => (self.rag_reranker_model.clone(), self.rag_top_k),
+        };
+        let agent_prelude = match &self.agent {
+            Some(agent) => agent.agent_prelude(),
+            None => self.agent_prelude.as_deref(),
+        };
         let role = self.extract_role();
         let mut items = vec![
             ("model", role.model().id()),
@@ -519,26 +539,27 @@ impl Config {
             ("keybindings", self.keybindings.clone()),
             ("wrap", wrap),
             ("wrap_code", self.wrap_code.to_string()),
-            ("save_session", format_option_value(&self.save_session)),
-            ("compress_threshold", self.compress_threshold.to_string()),
             ("function_calling", self.function_calling.to_string()),
             ("use_tools", format_option_value(&role.use_tools())),
+            ("agent_prelude", format_option_value(&agent_prelude)),
+            ("save_session", format_option_value(&self.save_session)),
+            ("compress_threshold", self.compress_threshold.to_string()),
             (
                 "rag_reranker_model",
-                format_option_value(&self.rag_reranker_model),
+                format_option_value(&rag_reranker_model),
             ),
-            ("rag_top_k", self.rag_top_k.to_string()),
+            ("rag_top_k", rag_top_k.to_string()),
             ("highlight", self.highlight.to_string()),
             ("light_theme", self.light_theme.to_string()),
+            ("env_file", display_path(&Self::env_file()?)),
             ("config_file", display_path(&Self::config_file()?)),
             ("roles_dir", display_path(&Self::roles_dir()?)),
-            ("env_file", display_path(&Self::env_file()?)),
-            ("functions_dir", display_path(&Self::functions_dir()?)),
-            ("rags_dir", display_path(&Self::rags_dir()?)),
             ("sessions_dir", display_path(&self.sessions_dir()?)),
+            ("rags_dir", display_path(&Self::rags_dir()?)),
+            ("functions_dir", display_path(&Self::functions_dir()?)),
             ("messages_file", display_path(&self.messages_file()?)),
         ];
-        if let Ok((_, Some(log_path))) = Self::log(self.working_mode.is_serve()) {
+        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
             items.push(("log_path", display_path(&log_path)));
         }
         let output = items
@@ -549,7 +570,7 @@ impl Config {
         Ok(output)
     }
 
-    pub fn update(&mut self, data: &str) -> Result<()> {
+    pub fn update(config: &GlobalConfig, data: &str) -> Result<()> {
         let parts: Vec<&str> = data.split_whitespace().collect();
         if parts.len() != 2 {
             bail!("Usage: .set <key> <value>. If value is null, unset key.");
@@ -559,65 +580,133 @@ impl Config {
         match key {
             "max_output_tokens" => {
                 let value = parse_value(value)?;
-                self.set_max_output_tokens(value);
+                config.write().set_max_output_tokens(value);
             }
             "temperature" => {
                 let value = parse_value(value)?;
-                self.set_temperature(value);
+                config.write().set_temperature(value);
             }
             "top_p" => {
                 let value = parse_value(value)?;
-                self.set_top_p(value);
+                config.write().set_top_p(value);
             }
             "dry_run" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                self.dry_run = value;
+                config.write().dry_run = value;
             }
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                self.stream = value;
+                config.write().stream = value;
             }
             "save" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                self.save = value;
-            }
-            "rag_reranker_model" => {
-                self.rag_reranker_model = if value == "null" {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }
-            "rag_top_k" => {
-                if let Some(value) = parse_value(value)? {
-                    self.rag_top_k = value;
-                }
+                config.write().save = value;
             }
             "function_calling" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                if value && self.functions.is_empty() {
+                if value && config.write().functions.is_empty() {
                     bail!("Function calling cannot be enabled because no functions are installed.")
                 }
-                self.function_calling = value;
+                config.write().function_calling = value;
             }
             "use_tools" => {
                 let value = parse_value(value)?;
-                self.set_use_tools(value);
+                config.write().set_use_tools(value);
+            }
+            "agent_prelude" => {
+                let value = parse_value(value)?;
+                config.write().set_agent_prelude(value);
             }
             "save_session" => {
                 let value = parse_value(value)?;
-                self.set_save_session(value);
+                config.write().set_save_session(value);
             }
             "compress_threshold" => {
                 let value = parse_value(value)?;
-                self.set_compress_threshold(value);
+                config.write().set_compress_threshold(value);
+            }
+            "rag_reranker_model" => {
+                let value = parse_value(value)?;
+                Self::set_rag_reranker_model(config, value)?;
+            }
+            "rag_top_k" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                Self::set_rag_top_k(config, value)?;
             }
             "highlight" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                self.highlight = value;
+                config.write().highlight = value;
             }
-            _ => bail!("Unknown key `{key}`"),
+            _ => bail!("Unknown key '{key}'"),
         }
+        Ok(())
+    }
+
+    pub fn delete(config: &GlobalConfig, kind: &str) -> Result<()> {
+        let (dir, file_ext) = match kind {
+            "roles" => (Self::roles_dir()?, Some(".md")),
+            "sessions" => (config.read().sessions_dir()?, Some(".yaml")),
+            "rags" => (Self::rags_dir()?, Some(".yaml")),
+            "agents" => (Self::agents_config_dir()?, None),
+            _ => bail!("Unknown kind '{kind}'"),
+        };
+        let names = match read_dir(&dir) {
+            Ok(rd) => {
+                let mut names = vec![];
+                for entry in rd.flatten() {
+                    let name = entry.file_name();
+                    match file_ext {
+                        Some(file_ext) => {
+                            if let Some(name) = name.to_string_lossy().strip_suffix(file_ext) {
+                                names.push(name.to_string());
+                            }
+                        }
+                        None => {
+                            if entry.path().is_dir() {
+                                names.push(name.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+                names.sort_unstable();
+                names
+            }
+            Err(_) => vec![],
+        };
+
+        if names.is_empty() {
+            bail!("No {kind} to delete")
+        }
+
+        let select_names = MultiSelect::new(&format!("Select {kind} to delete:"), names)
+            .with_validator(|list: &[ListOption<&String>]| {
+                if list.is_empty() {
+                    Ok(Validation::Invalid(
+                        "At least one item must be selected".into(),
+                    ))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            })
+            .prompt()?;
+
+        for name in select_names {
+            match file_ext {
+                Some(ext) => {
+                    let path = dir.join(format!("{name}{ext}"));
+                    remove_file(&path).with_context(|| {
+                        format!("Failed to delete {kind} at '{}'", path.display())
+                    })?;
+                }
+                None => {
+                    let path = dir.join(name);
+                    remove_dir_all(&path).with_context(|| {
+                        format!("Failed to delete {kind} at '{}'", path.display())
+                    })?;
+                }
+            }
+        }
+        println!("✨ Successfully deleted {kind}.");
         Ok(())
     }
 
@@ -642,6 +731,13 @@ impl Config {
         }
     }
 
+    pub fn set_agent_prelude(&mut self, value: Option<String>) {
+        match self.agent.as_mut() {
+            Some(agent) => agent.set_agent_prelude(value),
+            None => self.agent_prelude = value,
+        }
+    }
+
     pub fn set_save_session(&mut self, value: Option<bool>) {
         if let Some(session) = self.session.as_mut() {
             session.set_save_session(value);
@@ -656,6 +752,33 @@ impl Config {
         } else {
             self.compress_threshold = value.unwrap_or_default();
         }
+    }
+
+    pub fn set_rag_reranker_model(config: &GlobalConfig, value: Option<String>) -> Result<()> {
+        if let Some(id) = &value {
+            Model::retrieve_reranker(&config.read(), id)?;
+        }
+        let has_rag = config.read().rag.is_some();
+        match has_rag {
+            true => update_rag(config, |rag| {
+                rag.set_reranker_model(value)?;
+                Ok(())
+            })?,
+            false => config.write().rag_reranker_model = value,
+        }
+        Ok(())
+    }
+
+    pub fn set_rag_top_k(config: &GlobalConfig, value: usize) -> Result<()> {
+        let has_rag = config.read().rag.is_some();
+        match has_rag {
+            true => update_rag(config, |rag| {
+                rag.set_top_k(value)?;
+                Ok(())
+            })?,
+            false => config.write().rag_top_k = value,
+        }
+        Ok(())
     }
 
     pub fn set_wrap(&mut self, value: &str) -> Result<()> {
@@ -739,11 +862,7 @@ impl Config {
             let content = read_to_string(&path)?;
             Role::new(name, &content)
         } else {
-            BUILTIN_ROLES
-                .iter()
-                .find(|v| v.name() == name)
-                .cloned()
-                .ok_or_else(|| anyhow!("Unknown role `{name}`"))?
+            Role::builtin(name)?
         };
         match role.model_id() {
             Some(model_id) => {
@@ -790,20 +909,25 @@ impl Config {
 
     pub fn save_role(&mut self, name: Option<&str>) -> Result<()> {
         let mut role_name = match &self.role {
-            Some(role) => match name {
-                Some(v) => v.to_string(),
-                None => role.name().to_string(),
-            },
+            Some(role) => {
+                if role.has_args() {
+                    bail!("Unable to save the role with arguments (whose name contains '#')")
+                }
+                match name {
+                    Some(v) => v.to_string(),
+                    None => role.name().to_string(),
+                }
+            }
             None => bail!("No role"),
         };
-        if role_name.contains('#') {
-            bail!("Unable to save role with arguments")
-        }
         if role_name == TEMP_ROLE_NAME {
             role_name = Text::new("Role name:")
                 .with_validator(|input: &str| {
-                    if input.trim().is_empty() {
-                        Ok(Validation::Invalid("This field is required".into()))
+                    let input = input.trim();
+                    if input.is_empty() {
+                        Ok(Validation::Invalid("This name is required".into()))
+                    } else if input == TEMP_ROLE_NAME {
+                        Ok(Validation::Invalid("This name is reserved".into()))
                     } else {
                         Ok(Validation::Valid)
                     }
@@ -812,20 +936,14 @@ impl Config {
         }
         let role_path = Self::role_file(&role_name)?;
         if let Some(role) = self.role.as_mut() {
-            let old_name = role.name().to_string();
             role.save(&role_name, &role_path, self.working_mode.is_repl())?;
-            if old_name != role_name {
-                if let Ok(path) = Self::role_file(&old_name) {
-                    let _ = remove_file(&path);
-                }
-            }
         }
 
         Ok(())
     }
 
     pub fn all_roles() -> Vec<Role> {
-        let mut roles: HashMap<String, Role> = BUILTIN_ROLES
+        let mut roles: HashMap<String, Role> = Role::list_builtin_roles()
             .iter()
             .map(|v| (v.name().to_string(), v.clone()))
             .collect();
@@ -857,7 +975,7 @@ impl Config {
             }
         }
         if with_builtin {
-            names.extend(BUILTIN_ROLES.iter().map(|v| v.name().to_string()));
+            names.extend(Role::list_builtin_role_names());
         }
         let mut names: Vec<_> = names.into_iter().collect();
         names.sort_unstable();
@@ -944,13 +1062,7 @@ impl Config {
         };
         let session_path = self.session_file(&session_name)?;
         if let Some(session) = self.session.as_mut() {
-            let old_name = session.name().to_string();
             session.save(&session_name, &session_path, self.working_mode.is_repl())?;
-            if old_name != session_name {
-                if let Ok(path) = self.session_file(&old_name) {
-                    let _ = remove_file(&path);
-                }
-            }
         }
         Ok(())
     }
@@ -1078,15 +1190,23 @@ impl Config {
     }
 
     pub async fn rebuild_rag(config: &GlobalConfig, abort_signal: AbortSignal) -> Result<()> {
-        let rag_name = match config.read().rag.clone() {
-            Some(v) => v.name().to_string(),
+        let mut rag = match config.read().rag.clone() {
+            Some(v) => v.as_ref().clone(),
             None => bail!("No RAG"),
         };
-        let rag_path = config.read().rag_file(&rag_name)?;
-        let mut rag = Rag::load(config, &rag_name, &rag_path)?;
-        rag.rebuild(config, &rag_path, abort_signal).await?;
+        rag.rebuild(config, abort_signal).await?;
         config.write().rag = Some(Arc::new(rag));
         Ok(())
+    }
+
+    pub fn rag_sources(config: &GlobalConfig) -> Result<String> {
+        match config.read().rag.as_ref() {
+            Some(rag) => match rag.get_last_sources() {
+                Some(v) => Ok(v),
+                None => bail!("No sources"),
+            },
+            None => bail!("No RAG"),
+        }
     }
 
     pub fn rag_info(&self) -> Result<String> {
@@ -1108,34 +1228,26 @@ impl Config {
         text: &str,
         abort_signal: AbortSignal,
     ) -> Result<String> {
-        let (top_k, min_score_vector_search, min_score_keyword_search) = {
+        let (reranker_model, top_k) = rag.get_config();
+        let (min_score_vector_search, min_score_keyword_search) = {
             let config = config.read();
             (
-                config.rag_top_k,
                 config.rag_min_score_vector_search,
                 config.rag_min_score_keyword_search,
             )
         };
-        let rerank = match config.read().rag_reranker_model.clone() {
-            Some(reranker_model_id) => {
-                let min_score = config.read().rag_min_score_rerank;
-                let rerank_model = Model::retrieve_reranker(&config.read(), &reranker_model_id)?;
-                let rerank_client = init_client(config, Some(rerank_model))?;
-                Some((rerank_client, min_score))
-            }
-            None => None,
-        };
-        let embeddings = rag
+        let (embeddings, ids) = rag
             .search(
                 text,
                 top_k,
                 min_score_vector_search,
                 min_score_keyword_search,
-                rerank,
+                reranker_model.as_deref(),
                 abort_signal,
             )
             .await?;
         let text = config.read().rag_template(&embeddings, text);
+        rag.set_last_sources(&ids);
         Ok(text)
     }
 
@@ -1149,7 +1261,7 @@ impl Config {
                 let mut names = vec![];
                 for entry in rd.flatten() {
                     let name = entry.file_name();
-                    if let Some(name) = name.to_string_lossy().strip_suffix(".bin") {
+                    if let Some(name) = name.to_string_lossy().strip_suffix(".yaml") {
                         names.push(name.to_string());
                     }
                 }
@@ -1184,13 +1296,9 @@ impl Config {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = Agent::init(config, name, abort_signal).await?;
-        let session = session.map(|v| v.to_string()).or_else(|| {
-            agent
-                .agent_prelude()
-                .map(|v| v.to_string())
-                .or_else(|| config.read().agent_prelude.clone())
-                .and_then(|v| if v.is_empty() { None } else { Some(v) })
-        });
+        let session = session
+            .map(|v| v.to_string())
+            .or_else(|| agent.agent_prelude().map(|v| v.to_string()));
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         if let Some(session) = session {
@@ -1227,6 +1335,14 @@ impl Config {
             None => bail!("No agent"),
         };
         Ok(())
+    }
+
+    pub fn save_agent_config(&mut self) -> Result<()> {
+        let agent = match &self.agent {
+            Some(v) => v,
+            None => bail!("No agent"),
+        };
+        agent.save_config()
     }
 
     pub fn exit_agent(&mut self) -> Result<()> {
@@ -1284,20 +1400,21 @@ impl Config {
                     .iter()
                     .map(|v| v.name.to_string())
                     .collect();
-                for item in use_tools.split(',') {
-                    let item = item.trim();
-                    if item == "all" {
-                        tool_names.extend(declaration_names);
-                        break;
-                    } else if let Some(values) = self.mapping_tools.get(item) {
-                        tool_names.extend(
-                            values
-                                .split(',')
-                                .map(|v| v.to_string())
-                                .filter(|v| declaration_names.contains(v)),
-                        )
-                    } else if declaration_names.contains(item) {
-                        tool_names.insert(item.to_string());
+                if use_tools == "all" {
+                    tool_names.extend(declaration_names);
+                } else {
+                    for item in use_tools.split(',') {
+                        let item = item.trim();
+                        if let Some(values) = self.mapping_tools.get(item) {
+                            tool_names.extend(
+                                values
+                                    .split(',')
+                                    .map(|v| v.to_string())
+                                    .filter(|v| declaration_names.contains(v)),
+                            )
+                        } else if declaration_names.contains(item) {
+                            tool_names.insert(item.to_string());
+                        }
                     }
                 }
                 functions = self
@@ -1358,27 +1475,16 @@ impl Config {
         let mut filter = "";
         if args.len() == 1 {
             values = match cmd {
-                ".role" => Self::list_roles(true)
-                    .into_iter()
-                    .map(|v| (v, None))
-                    .collect(),
+                ".role" => map_completion_values(Self::list_roles(true)),
                 ".model" => list_chat_models(self)
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
-                ".session" => self
-                    .list_sessions()
-                    .into_iter()
-                    .map(|v| (v, None))
-                    .collect(),
-                ".rag" => Self::list_rags().into_iter().map(|v| (v, None)).collect(),
-                ".agent" => list_agents().into_iter().map(|v| (v, None)).collect(),
+                ".session" => map_completion_values(self.list_sessions()),
+                ".rag" => map_completion_values(Self::list_rags()),
+                ".agent" => map_completion_values(list_agents()),
                 ".starter" => match &self.agent {
-                    Some(agent) => agent
-                        .conversation_staters()
-                        .iter()
-                        .map(|v| (v.clone(), None))
-                        .collect(),
+                    Some(agent) => map_completion_values(agent.conversation_staters().to_vec()),
                     None => vec![],
                 },
                 ".variable" => match &self.agent {
@@ -1389,24 +1495,30 @@ impl Config {
                         .collect(),
                     None => vec![],
                 },
-                ".set" => vec![
-                    "max_output_tokens",
-                    "temperature",
-                    "top_p",
-                    "dry_run",
-                    "stream",
-                    "save",
-                    "save_session",
-                    "compress_threshold",
-                    "function_calling",
-                    "use_tools",
-                    "rag_reranker_model",
-                    "rag_top_k",
-                    "highlight",
-                ]
-                .into_iter()
-                .map(|v| (format!("{v} "), None))
-                .collect(),
+                ".set" => {
+                    let mut values = vec![
+                        "max_output_tokens",
+                        "temperature",
+                        "top_p",
+                        "dry_run",
+                        "stream",
+                        "save",
+                        "function_calling",
+                        "use_tools",
+                        "agent_prelude",
+                        "save_session",
+                        "compress_threshold",
+                        "rag_reranker_model",
+                        "rag_top_k",
+                        "highlight",
+                    ];
+                    values.sort_unstable();
+                    values
+                        .into_iter()
+                        .map(|v| (format!("{v} "), None))
+                        .collect()
+                }
+                ".delete" => map_completion_values(vec!["roles", "sessions", "rags", "agents"]),
                 _ => vec![],
             };
             filter = args[0]
@@ -1419,6 +1531,26 @@ impl Config {
                 "dry_run" => complete_bool(self.dry_run),
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
+                "function_calling" => complete_bool(self.function_calling),
+                "use_tools" => {
+                    let mut prefix = String::new();
+                    let mut ignores = HashSet::new();
+                    if let Some((v, _)) = args[1].rsplit_once(',') {
+                        ignores = v.split(',').collect();
+                        prefix = format!("{v},");
+                    }
+                    let mut values = vec![];
+                    if prefix.is_empty() {
+                        values.push("all".to_string());
+                    }
+                    values.extend(self.functions.declarations().iter().map(|v| v.name.clone()));
+                    values.extend(self.mapping_tools.keys().map(|v| v.to_string()));
+                    values
+                        .into_iter()
+                        .filter(|v| !ignores.contains(v.as_str()))
+                        .map(|v| format!("{prefix}{v}"))
+                        .collect()
+                }
                 "save_session" => {
                     let save_session = if let Some(session) = &self.session {
                         session.save_session()
@@ -1426,24 +1558,6 @@ impl Config {
                         self.save_session
                     };
                     complete_option_bool(save_session)
-                }
-                "function_calling" => complete_bool(self.function_calling),
-                "use_tools" => {
-                    let mut prefix = String::new();
-                    if let Some((v, _)) = args[1].rsplit_once(',') {
-                        prefix = format!("{v},");
-                    }
-                    let mut values = vec![];
-                    if prefix.is_empty() {
-                        values.push("all".to_string());
-                    }
-                    values.extend(self.mapping_tools.keys().map(|v| v.to_string()));
-                    values.extend(self.functions.declarations().iter().map(|v| v.name.clone()));
-                    values
-                        .into_iter()
-                        .filter(|v| !prefix.contains(&format!("{v},")))
-                        .map(|v| format!("{prefix}{v}"))
-                        .collect()
                 }
                 "rag_reranker_model" => list_reranker_models(self).iter().map(|v| v.id()).collect(),
                 "highlight" => complete_bool(self.highlight),
@@ -1480,7 +1594,7 @@ impl Config {
             let theme_path = Self::local_path(&theme_filename)?;
             if theme_path.exists() {
                 let theme = ThemeSet::get_theme(&theme_path)
-                    .with_context(|| format!("Invalid theme at {}", theme_path.display()))?;
+                    .with_context(|| format!("Invalid theme at '{}'", theme_path.display()))?;
                 Some(theme)
             } else {
                 let theme = if self.light_theme {
@@ -1678,7 +1792,7 @@ impl Config {
 
     fn load_from_file(config_path: &Path) -> Result<Self> {
         let content = read_to_string(config_path)
-            .with_context(|| format!("Failed to load config at {}", config_path.display()))?;
+            .with_context(|| format!("Failed to load config at '{}'", config_path.display()))?;
         let config: Self = serde_yaml::from_str(&content).map_err(|err| {
             let err_msg = err.to_string();
             let err_msg = if err_msg.starts_with(&format!("{}: ", CLIENTS_FIELD)) {
@@ -1756,6 +1870,18 @@ impl Config {
             self.wrap_code = v;
         }
 
+        if let Some(Some(v)) = read_env_bool("function_calling") {
+            self.function_calling = v;
+        }
+        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
+            if let Ok(v) = serde_json::from_str(&v) {
+                self.mapping_tools = v;
+            }
+        }
+        if let Some(v) = read_env_value::<String>("use_tools") {
+            self.use_tools = v;
+        }
+
         if let Some(v) = read_env_value::<String>("prelude") {
             self.prelude = v;
         }
@@ -1779,18 +1905,6 @@ impl Config {
             self.summary_prompt = v;
         }
 
-        if let Some(Some(v)) = read_env_bool("function_calling") {
-            self.function_calling = v;
-        }
-        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mapping_tools = v;
-            }
-        }
-        if let Some(v) = read_env_value::<String>("use_tools") {
-            self.use_tools = v;
-        }
-
         if let Some(v) = read_env_value::<String>("rag_embedding_model") {
             self.rag_embedding_model = v;
         }
@@ -1811,9 +1925,6 @@ impl Config {
         }
         if let Some(Some(v)) = read_env_value::<f32>("rag_min_score_keyword_search") {
             self.rag_min_score_keyword_search = v;
-        }
-        if let Some(Some(v)) = read_env_value::<f32>("rag_min_score_rerank") {
-            self.rag_min_score_rerank = v;
         }
         if let Some(v) = read_env_value::<String>("rag_template") {
             self.rag_template = v;
@@ -1847,6 +1958,10 @@ impl Config {
         }
         if let Some(v) = read_env_value::<String>("right_prompt") {
             self.right_prompt = v;
+        }
+
+        if let Some(v) = read_env_value::<String>("serve_addr") {
+            self.serve_addr = v;
         }
     }
 
@@ -2039,4 +2154,21 @@ fn complete_option_bool(value: Option<bool>) -> Vec<String> {
         Some(false) => vec!["true".to_string(), "null".to_string()],
         None => vec!["true".to_string(), "false".to_string()],
     }
+}
+
+fn map_completion_values<T: ToString>(value: Vec<T>) -> Vec<(String, Option<String>)> {
+    value.into_iter().map(|v| (v.to_string(), None)).collect()
+}
+
+fn update_rag<F>(config: &GlobalConfig, f: F) -> Result<()>
+where
+    F: FnOnce(&mut Rag) -> Result<()>,
+{
+    let mut rag = match config.read().rag.clone() {
+        Some(v) => v.as_ref().clone(),
+        None => bail!("No RAG"),
+    };
+    f(&mut rag)?;
+    config.write().rag = Some(Arc::new(rag));
+    Ok(())
 }

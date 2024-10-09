@@ -1,6 +1,6 @@
 [package]
 name = "aichat"
-version = "0.21.1"
+version = "0.22.0"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one AI CLI Tool"
@@ -59,9 +59,11 @@ path-absolutize = "3.1.1"
 hnsw_rs = "0.3.0"
 rayon = "1.10.0"
 uuid = { version = "1.9.1", features = ["v4"] }
-html2text = "0.12.5"
 scraper = { version = "0.20.0", default-features = false, features = ["deterministic"] }
 sys-locale = "0.3.1"
+html_to_markdown = "0.1.0"
+rust-embed = "8.5.0"
+os_info = { version = "3.8.2", default-features = false }
 
 [dependencies.reqwest]
 version = "0.12.0"

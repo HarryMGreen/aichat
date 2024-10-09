@@ -298,11 +298,14 @@ impl Session {
                 if !ans {
                     return Ok(());
                 }
-                while session_name == TEMP_SESSION_NAME {
+                if session_name == TEMP_SESSION_NAME {
                     session_name = Text::new("Session name:")
                         .with_validator(|input: &str| {
-                            if input.trim().is_empty() {
-                                Ok(Validation::Invalid("This field is required".into()))
+                            let input = input.trim();
+                            if input.is_empty() {
+                                Ok(Validation::Invalid("This name is required".into()))
+                            } else if input == TEMP_SESSION_NAME {
+                                Ok(Validation::Invalid("This name is reserved".into()))
                             } else {
                                 Ok(Validation::Valid)
                             }
@@ -326,10 +329,10 @@ impl Session {
         self.path = Some(session_path.display().to_string());
 
         let content = serde_yaml::to_string(&self)
-            .with_context(|| format!("Failed to serde session {}", self.name))?;
+            .with_context(|| format!("Failed to serde session '{}'", self.name))?;
         write(session_path, content).with_context(|| {
             format!(
-                "Failed to write session {} to {}",
+                "Failed to write session '{}' to '{}'",
                 self.name,
                 session_path.display()
             )

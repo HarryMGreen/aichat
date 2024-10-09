@@ -4,52 +4,21 @@ use crate::client::{Message, MessageContent, MessageRole, Model};
 
 use anyhow::Result;
 use fancy_regex::Regex;
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const SHELL_ROLE: &str = "%shell%";
 pub const EXPLAIN_SHELL_ROLE: &str = "%explain-shell%";
 pub const CODE_ROLE: &str = "%code%";
-pub const FUNCTIONS_ROLE: &str = "%functions%";
 
 pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 
-lazy_static::lazy_static! {
-    pub static ref BUILTIN_ROLES: Vec<Role> = {
-        [
-            (SHELL_ROLE, shell_prompt()),
-            (
-                EXPLAIN_SHELL_ROLE,
-                r#"Provide a terse, single sentence description of the given shell command.
-Describe each argument and option of the command.
-Provide short responses in about 80 words.
-APPLY MARKDOWN formatting when possible."#
-                    .into(),
-            ),
-            (
-                CODE_ROLE,
-                r#"Provide only code without comments or explanations.
-### INPUT:
-async sleep in js
-### OUTPUT:
-```javascript
-async function timeout(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-```
-"#
-                .into(),
-            ),
-            (FUNCTIONS_ROLE, r#"---
-use_tools: all
----
-    "#.into()),
-        ]
-        .into_iter()
-        .map(|(name, content)| Role::new(name, &content))
-        .collect()
-    };
+#[derive(Embed)]
+#[folder = "assets/roles/"]
+struct RolesAsset;
 
+lazy_static::lazy_static! {
     static ref RE_METADATA: Regex = Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap();
 }
 
@@ -97,9 +66,11 @@ impl Role {
                 prompt = prompt_value.as_str().trim();
             }
         }
+        let mut prompt = complete_prompt_args(prompt, name);
+        interpolate_variables(&mut prompt);
         let mut role = Self {
             name: name.to_string(),
-            prompt: complete_prompt_args(prompt, name),
+            prompt,
             ..Default::default()
         };
         if !metadata.is_empty() {
@@ -120,6 +91,25 @@ impl Role {
         role
     }
 
+    pub fn builtin(name: &str) -> Result<Self> {
+        let content = RolesAsset::get(&format!("{name}.md"))
+            .ok_or_else(|| anyhow!("Unknown role `{name}`"))?;
+        let content = unsafe { std::str::from_utf8_unchecked(&content.data) };
+        Ok(Role::new(name, content))
+    }
+
+    pub fn list_builtin_role_names() -> Vec<String> {
+        RolesAsset::iter()
+            .filter_map(|v| v.strip_suffix(".md").map(|v| v.to_string()))
+            .collect()
+    }
+
+    pub fn list_builtin_roles() -> Vec<Self> {
+        RolesAsset::iter()
+            .filter_map(|v| Role::builtin(&v).ok())
+            .collect()
+    }
+
     pub fn match_name(names: &[String], name: &str) -> Option<String> {
         if names.contains(&name.to_string()) {
             Some(name.to_string())
@@ -135,6 +125,10 @@ impl Role {
                 .find(|v| v.starts_with(&prefix) && v.split('#').count() == parts_len)
                 .cloned()
         }
+    }
+
+    pub fn has_args(&self) -> bool {
+        self.name.contains('#')
     }
 
     pub fn export(&self) -> String {
@@ -381,23 +375,6 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
     }
 
     (prompt, vec![])
-}
-
-fn shell_prompt() -> String {
-    let os = OS.as_str();
-    let shell = SHELL.name.as_str();
-    let combinator = if shell == "powershell" {
-        "If multiple steps required try to combine them together using ';'.\nIf it already combined with '&&' try to replace it with ';'.".to_string()
-    } else {
-        "If multiple steps required try to combine them together using '&&'.".to_string()
-    };
-    format!(
-        r#"Provide only {shell} commands for {os} without any description.
-Ensure the output is a valid {shell} command.
-{combinator}
-If there is a lack of details, provide most logical solution.
-Output plain text only, without any markdown formatting."#
-    )
 }
 
 #[cfg(test)]

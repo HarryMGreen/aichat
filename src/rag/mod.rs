@@ -8,27 +8,28 @@ use crate::utils::*;
 
 mod bm25;
 mod loader;
+mod serde_vectors;
 mod splitter;
 
-use anyhow::bail;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use inquire::{required, validator::Validation, Confirm, Select, Text};
+use parking_lot::RwLock;
 use path_absolutize::Absolutize;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
-use std::{fmt::Debug, io::BufReader, path::Path};
+use std::{collections::HashMap, fmt::Debug, fs, path::Path};
 
 pub struct Rag {
+    config: GlobalConfig,
     name: String,
     path: String,
     embedding_model: Model,
     hnsw: Hnsw<'static, f32, DistCosine>,
     bm25: BM25<DocumentId>,
     data: RagData,
-    embedding_client: Box<dyn Client>,
+    last_sources: RwLock<Option<String>>,
 }
 
 impl Debug for Rag {
@@ -42,6 +43,21 @@ impl Debug for Rag {
     }
 }
 
+impl Clone for Rag {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            name: self.name.clone(),
+            path: self.path.clone(),
+            embedding_model: self.embedding_model.clone(),
+            hnsw: self.data.build_hnsw(),
+            bm25: self.bm25.clone(),
+            data: self.data.clone(),
+            last_sources: RwLock::new(None),
+        }
+    }
+}
+
 impl Rag {
     pub async fn init(
         config: &GlobalConfig,
@@ -51,8 +67,18 @@ impl Rag {
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         debug!("init rag: {name}");
-        let (embedding_model, chunk_size, chunk_overlap) = Self::config(config)?;
-        let data = RagData::new(embedding_model.id(), chunk_size, chunk_overlap);
+        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(config)?;
+        let (reranker_model, top_k) = {
+            let config = config.read();
+            (config.rag_reranker_model.clone(), config.rag_top_k)
+        };
+        let data = RagData::new(
+            embedding_model.id(),
+            chunk_size,
+            chunk_overlap,
+            reranker_model,
+            top_k,
+        );
         let mut rag = Self::create(config, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
@@ -71,8 +97,7 @@ impl Rag {
                 bail!("Aborted!")
             },
         };
-        if !rag.is_temp() {
-            rag.save(save_path)?;
+        if rag.save()? {
             println!("✨ Saved rag to '{}'", save_path.display());
         }
         Ok(rag)
@@ -80,9 +105,8 @@ impl Rag {
 
     pub fn load(config: &GlobalConfig, name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
-        let file = std::fs::File::open(path).with_context(err)?;
-        let reader = BufReader::new(file);
-        let data: RagData = bincode::deserialize_from(reader).with_context(err)?;
+        let content = fs::read_to_string(path).with_context(err)?;
+        let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
         Self::create(config, name, path, data)
     }
 
@@ -90,15 +114,15 @@ impl Rag {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
         let embedding_model = Model::retrieve_embedding(&config.read(), &data.embedding_model)?;
-        let embedding_client = init_client(config, Some(embedding_model.clone()))?;
         let rag = Rag {
+            config: config.clone(),
             name: name.to_string(),
             path: path.display().to_string(),
             data,
             embedding_model,
             hnsw,
             bm25,
-            embedding_client,
+            last_sources: RwLock::new(None),
         };
         Ok(rag)
     }
@@ -106,7 +130,6 @@ impl Rag {
     pub async fn rebuild(
         &mut self,
         config: &GlobalConfig,
-        save_path: &Path,
         abort_signal: AbortSignal,
     ) -> Result<()> {
         debug!("rebuild rag: {}", self.name);
@@ -123,14 +146,13 @@ impl Rag {
                 bail!("Aborted!")
             },
         };
-        if !self.is_temp() {
-            self.save(save_path)?;
-            println!("✨ Saved rag to '{}'", save_path.display());
+        if self.save()? {
+            println!("✨ Saved rag to '{}'", self.path);
         }
         Ok(())
     }
 
-    pub fn config(config: &GlobalConfig) -> Result<(Model, usize, usize)> {
+    pub fn create_config(config: &GlobalConfig) -> Result<(Model, usize, usize)> {
         let (embedding_model_id, chunk_size, chunk_overlap) = {
             let config = config.read();
             (
@@ -194,12 +216,57 @@ impl Rag {
         Ok((embedding_model, chunk_size, chunk_overlap))
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        ensure_parent_exists(path)?;
-        let mut file = std::fs::File::create(path)?;
-        bincode::serialize_into(&mut file, &self.data)
-            .with_context(|| format!("Failed to save rag '{}'", self.name))?;
+    pub fn get_config(&self) -> (Option<String>, usize) {
+        (self.data.reranker_model.clone(), self.data.top_k)
+    }
+
+    pub fn get_last_sources(&self) -> Option<String> {
+        self.last_sources.read().clone()
+    }
+
+    pub fn set_last_sources(&self, ids: &[DocumentId]) {
+        let sources: IndexSet<_> = ids
+            .iter()
+            .filter_map(|id| {
+                let (file_index, _) = split_document_id(*id);
+                let file = self.data.files.get(&file_index)?;
+                Some(file.path.clone())
+            })
+            .collect();
+        let sources = if sources.is_empty() {
+            None
+        } else {
+            Some(sources.into_iter().collect::<Vec<_>>().join("\n"))
+        };
+        *self.last_sources.write() = sources;
+    }
+
+    pub fn set_reranker_model(&mut self, reranker_model: Option<String>) -> Result<()> {
+        self.data.reranker_model = reranker_model;
+        self.save()?;
         Ok(())
+    }
+
+    pub fn set_top_k(&mut self, top_k: usize) -> Result<()> {
+        self.data.top_k = top_k;
+        self.save()?;
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<bool> {
+        if self.is_temp() {
+            return Ok(false);
+        }
+        let path = Path::new(&self.path);
+        ensure_parent_exists(path)?;
+
+        let content = serde_yaml::to_string(&self.data)
+            .with_context(|| format!("Failed to serde rag '{}'", self.name))?;
+        fs::write(path, content).with_context(|| {
+            format!("Failed to save rag '{}' to '{}'", self.name, path.display())
+        })?;
+
+        Ok(true)
     }
 
     pub fn export(&self) -> Result<String> {
@@ -219,6 +286,8 @@ impl Rag {
             "embedding_model": self.embedding_model.id(),
             "chunk_size": self.data.chunk_size,
             "chunk_overlap": self.data.chunk_overlap,
+            "reranker_model": self.data.reranker_model,
+            "top_k": self.data.top_k,
             "document_paths": self.data.document_paths,
             "files": files,
         });
@@ -241,12 +310,12 @@ impl Rag {
         top_k: usize,
         min_score_vector_search: f32,
         min_score_keyword_search: f32,
-        rerank: Option<(Box<dyn Client>, f32)>,
+        rerank_model: Option<&str>,
         abort_signal: AbortSignal,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<DocumentId>)> {
         let spinner = create_spinner("Searching").await;
         let ret = tokio::select! {
-            ret = self.hybird_search(text, top_k, min_score_vector_search, min_score_keyword_search, rerank) => {
+            ret = self.hybird_search(text, top_k, min_score_vector_search, min_score_keyword_search, rerank_model) => {
                 ret
             }
             _ = watch_abort_signal(abort_signal) => {
@@ -254,8 +323,9 @@ impl Rag {
             },
         };
         spinner.stop();
-        let output = ret?.join("\n\n");
-        Ok(output)
+        let (ids, documents): (Vec<_>, Vec<_>) = ret?.into_iter().unzip();
+        let embeddings = documents.join("\n\n");
+        Ok((embeddings, ids))
     }
 
     pub async fn sync_documents<T: AsRef<str>>(
@@ -275,16 +345,9 @@ impl Rag {
         for (index, path) in paths.iter().enumerate() {
             let path = path.as_ref();
             println!("Load {path} [{}/{paths_len}]", index + 1);
-            match load_document(&loaders, path).await {
-                Ok((path, document_files)) => {
-                    files.extend(document_files);
-                    document_paths.push(path);
-                }
-                Err(err) => {
-                    has_error = true;
-                    println!("{}", warning_text(&format!("Error: {err:?}")));
-                }
-            }
+            let (path, document_files) = load_document(&loaders, path, &mut has_error).await;
+            files.extend(document_files);
+            document_paths.push(path);
         }
 
         if has_error {
@@ -388,8 +451,8 @@ impl Rag {
         top_k: usize,
         min_score_vector_search: f32,
         min_score_keyword_search: f32,
-        rerank: Option<(Box<dyn Client>, f32)>,
-    ) -> Result<Vec<String>> {
+        rerank_model: Option<&str>,
+    ) -> Result<Vec<(DocumentId, String)>> {
         let (vector_search_result, text_search_result) = tokio::join!(
             self.vector_search(query, top_k, min_score_vector_search),
             self.keyword_search(query, top_k, min_score_keyword_search)
@@ -397,11 +460,14 @@ impl Rag {
         let vector_search_ids = vector_search_result?;
         let keyword_search_ids = text_search_result?;
         debug!(
-            "vector_search_ids: {vector_search_ids:?}, keyword_search_ids: {keyword_search_ids:?}"
+            "vector_search_ids: {:?}, keyword_search_ids: {:?}",
+            pretty_document_ids(&vector_search_ids),
+            pretty_document_ids(&keyword_search_ids)
         );
-        let ids = match rerank {
-            Some((client, min_score)) => {
-                let min_score = min_score as f64;
+        let ids = match rerank_model {
+            Some(model_id) => {
+                let model = Model::retrieve_reranker(&self.config.read(), model_id)?;
+                let client = init_client(&self.config, Some(model))?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()
                     .into_iter()
@@ -416,18 +482,12 @@ impl Rag {
                 }
                 let data = RerankData::new(query.to_string(), documents, top_k);
                 let list = client.rerank(data).await?;
-                let ids = list
+                let ids: Vec<_> = list
                     .into_iter()
                     .take(top_k)
-                    .filter_map(|item| {
-                        if item.relevance_score < min_score {
-                            None
-                        } else {
-                            documents_ids.get(item.index).cloned()
-                        }
-                    })
+                    .filter_map(|item| documents_ids.get(item.index).cloned())
                     .collect();
-                debug!("rerank_ids: {ids:?}");
+                debug!("rerank_ids: {:?}", pretty_document_ids(&ids));
                 ids
             }
             None => {
@@ -436,7 +496,7 @@ impl Rag {
                     vec![1.0, 1.0],
                     top_k,
                 );
-                debug!("rrf_ids: {ids:?}");
+                debug!("rrf_ids: {:?}", pretty_document_ids(&ids));
                 ids
             }
         };
@@ -444,7 +504,7 @@ impl Rag {
             .into_iter()
             .filter_map(|id| {
                 let document = self.data.get(id)?;
-                Some(document.page_content.clone())
+                Some((id, document.page_content.clone()))
             })
             .collect();
         Ok(output)
@@ -497,6 +557,7 @@ impl Rag {
         data: EmbeddingsData,
         spinner: Option<Spinner>,
     ) -> Result<EmbeddingsOutput> {
+        let embedding_client = init_client(&self.config, Some(self.embedding_model.clone()))?;
         let EmbeddingsData { texts, query } = data;
         let size = match self.embedding_model.max_input_tokens() {
             Some(max_input_tokens) => {
@@ -520,8 +581,7 @@ impl Rag {
                 texts: texts.to_vec(),
                 query,
             };
-            let chunk_output = self
-                .embedding_client
+            let chunk_output = embedding_client
                 .embeddings(chunk_data)
                 .await
                 .context("Failed to create embedding")?;
@@ -536,9 +596,12 @@ pub struct RagData {
     pub embedding_model: String,
     pub chunk_size: usize,
     pub chunk_overlap: usize,
+    pub reranker_model: Option<String>,
+    pub top_k: usize,
     pub next_file_id: FileId,
     pub document_paths: Vec<String>,
     pub files: IndexMap<FileId, RagFile>,
+    #[serde(with = "serde_vectors")]
     pub vectors: IndexMap<DocumentId, Vec<f32>>,
 }
 
@@ -556,11 +619,19 @@ impl Debug for RagData {
 }
 
 impl RagData {
-    pub fn new(embedding_model: String, chunk_size: usize, chunk_overlap: usize) -> Self {
+    pub fn new(
+        embedding_model: String,
+        chunk_size: usize,
+        chunk_overlap: usize,
+        reranker_model: Option<String>,
+        top_k: usize,
+    ) -> Self {
         Self {
             embedding_model,
             chunk_size,
             chunk_overlap,
+            reranker_model,
+            top_k,
             next_file_id: 0,
             document_paths: Default::default(),
             files: Default::default(),
@@ -665,6 +736,15 @@ pub fn split_document_id(value: DocumentId) -> (usize, usize) {
     (high, low)
 }
 
+fn pretty_document_ids(ids: &[DocumentId]) -> Vec<String> {
+    ids.iter()
+        .map(|v| {
+            let (h, l) = split_document_id(*v);
+            format!("{h}-{l}")
+        })
+        .collect()
+}
+
 fn select_embedding_model(models: &[&Model]) -> Result<String> {
     let models: Vec<_> = models
         .iter()
@@ -727,26 +807,6 @@ fn add_documents() -> Result<Vec<String>> {
         })
         .collect();
     Ok(paths)
-}
-
-async fn load_document(
-    loaders: &HashMap<String, String>,
-    path: &str,
-) -> Result<(String, Vec<(String, RagMetadata)>)> {
-    let mut files = vec![];
-    if is_url(path) {
-        if let Some(path) = path.strip_suffix("**") {
-            files.extend(load_recursive_url(loaders, path).await?);
-        } else {
-            files.push(load_url(loaders, path).await?);
-        }
-        Ok((path.to_string(), files))
-    } else {
-        let path = Path::new(path);
-        let path = path.absolutize()?.display().to_string();
-        files.extend(load_path(loaders, &path).await?);
-        Ok((path.to_string(), files))
-    }
 }
 
 fn progress(spinner: &Option<Spinner>, message: String) {
