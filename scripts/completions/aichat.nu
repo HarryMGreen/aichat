@@ -40,9 +40,11 @@ module completions {
     --prompt                                            # Use the system prompt
     --role(-r): string@"nu-complete aichat role"        # Select a role
     --session(-s): string@"nu-complete aichat session"  # Start or join a session
-    --save-session                                      # Forces the session to be saved
+    --empty-session                                     # Ensure the session is empty
+    --save-session                                      # Ensure the new conversation is saved to the session
     --agent(-a): string@"nu-complete aichat agent"      # Start a agent
-    --rag(-R): string@"nu-complete aichat rag"          # Start a RAG
+    --agent-variable                                    # Set agent variables
+    --rag: string@"nu-complete aichat rag"              # Start a RAG
     --serve                                             # Serve the LLM API and WebAPP
     --execute(-e)                                       # Execute commands in natural language
     --code(-c)                                          # Output code only

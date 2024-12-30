@@ -4,10 +4,9 @@ mod message;
 #[macro_use]
 mod macros;
 mod model;
-mod prompt_format;
 mod stream;
 
-pub use crate::function::{ToolCall, ToolResults};
+pub use crate::function::ToolCall;
 pub use crate::utils::PromptKind;
 pub use common::*;
 pub use message::*;
@@ -33,7 +32,6 @@ register_client!(
     ),
     (vertexai, "vertexai", VertexAIConfig, VertexAIClient),
     (bedrock, "bedrock", BedrockConfig, BedrockClient),
-    (replicate, "replicate", ReplicateConfig, ReplicateClient),
     (ernie, "ernie", ErnieConfig, ErnieClient),
 );
 
@@ -45,12 +43,11 @@ pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 21] = [
     ("fireworks", "https://api.fireworks.ai/inference/v1"),
     ("github", "https://models.inference.ai.azure.com"),
     ("groq", "https://api.groq.com/openai/v1"),
-    ("huggingface", "https://api-inference.huggingface.co/v1"),
+    ("hunyuan", "https://api.hunyuan.cloud.tencent.com/v1"),
     ("lingyiwanwu", "https://api.lingyiwanwu.com/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
     ("moonshot", "https://api.moonshot.cn/v1"),
     ("openrouter", "https://openrouter.ai/api/v1"),
-    ("octoai", "https://text.octoai.run/v1"),
     ("ollama", ""),
     ("perplexity", "https://api.perplexity.ai"),
     (
@@ -59,6 +56,7 @@ pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 21] = [
     ),
     ("siliconflow", "https://api.siliconflow.cn/v1"),
     ("together", "https://api.together.xyz/v1"),
+    ("xai", "https://api.x.ai/v1"),
     ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
     // RAG-dedicated
     ("jina", "https://api.jina.ai/v1"),

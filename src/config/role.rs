@@ -11,6 +11,7 @@ use serde_json::Value;
 pub const SHELL_ROLE: &str = "%shell%";
 pub const EXPLAIN_SHELL_ROLE: &str = "%explain-shell%";
 pub const CODE_ROLE: &str = "%code%";
+pub const CREATE_TITLE_ROLE: &str = "%create-title%";
 
 pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 
@@ -167,7 +168,7 @@ impl Role {
         })?;
 
         if is_repl {
-            println!("✨ Saved role to '{}'", role_path.display());
+            println!("✓ Saved role to '{}'.", role_path.display());
         }
 
         if role_name != self.name {
@@ -235,7 +236,7 @@ impl Role {
         } else if self.is_embedded_prompt() {
             self.prompt.replace(INPUT_PLACEHOLDER, &input_markdown)
         } else {
-            format!("{}\n\n{}", self.prompt, input.render())
+            format!("{}\n\n{}", self.prompt, input_markdown)
         }
     }
 

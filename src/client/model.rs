@@ -1,6 +1,7 @@
 use super::{
-    list_chat_models, list_embedding_models, list_reranker_models,
-    message::{Message, MessageContent},
+    list_all_models, list_client_names,
+    message::{Message, MessageContent, MessageContentPart},
+    ApiPatch, MessageContentToolCalls, RequestPatch,
 };
 
 use crate::config::Config;
@@ -8,6 +9,7 @@ use crate::utils::{estimate_token_length, format_option_value};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 const PER_MESSAGES_TOKENS: usize = 5;
 const BASIS_TOKENS: usize = 2;
@@ -42,29 +44,8 @@ impl Model {
             .collect()
     }
 
-    pub fn retrieve_chat(config: &Config, model_id: &str) -> Result<Self> {
-        match Self::find(&list_chat_models(config), model_id) {
-            Some(v) => Ok(v),
-            None => bail!("Unknown chat model '{model_id}'"),
-        }
-    }
-
-    pub fn retrieve_embedding(config: &Config, model_id: &str) -> Result<Self> {
-        match Self::find(&list_embedding_models(config), model_id) {
-            Some(v) => Ok(v),
-            None => bail!("Unknown embedding model '{model_id}'"),
-        }
-    }
-
-    pub fn retrieve_reranker(config: &Config, model_id: &str) -> Result<Self> {
-        match Self::find(&list_reranker_models(config), model_id) {
-            Some(v) => Ok(v),
-            None => bail!("Unknown reranker model '{model_id}'"),
-        }
-    }
-
-    pub fn find(models: &[&Self], model_id: &str) -> Option<Self> {
-        let mut model = None;
+    pub fn retrieve_model(config: &Config, model_id: &str, model_type: ModelType) -> Result<Self> {
+        let models = list_all_models(config);
         let (client_name, model_name) = match model_id.split_once(':') {
             Some((client_name, model_name)) => {
                 if model_name.is_empty() {
@@ -77,21 +58,33 @@ impl Model {
         };
         match model_name {
             Some(model_name) => {
-                if let Some(found) = models.iter().find(|v| v.id() == model_id) {
-                    model = Some((*found).clone());
-                } else if let Some(found) = models.iter().find(|v| v.client_name == client_name) {
-                    let mut found = (*found).clone();
-                    found.data.name = model_name.to_string();
-                    model = Some(found)
+                if let Some(model) = models.iter().find(|v| v.id() == model_id) {
+                    if model.model_type() == model_type {
+                        return Ok((*model).clone());
+                    } else {
+                        bail!("Model '{model_id}' is not a {model_type} model")
+                    }
+                }
+                if list_client_names(config)
+                    .into_iter()
+                    .any(|v| *v == client_name)
+                    && model_type.can_create_from_name()
+                {
+                    let mut new_model = Self::new(client_name, model_name);
+                    new_model.data.model_type = model_type.to_string();
+                    return Ok(new_model);
                 }
             }
             None => {
-                if let Some(found) = models.iter().find(|v| v.client_name == client_name) {
-                    model = Some((*found).clone());
+                if let Some(found) = models
+                    .iter()
+                    .find(|v| v.client_name == client_name && v.model_type() == model_type)
+                {
+                    return Ok((*found).clone());
                 }
             }
-        }
-        model
+        };
+        bail!("Unknown {model_type} model '{model_id}'")
     }
 
     pub fn id(&self) -> String {
@@ -110,8 +103,14 @@ impl Model {
         &self.data.name
     }
 
-    pub fn model_type(&self) -> &str {
-        &self.data.model_type
+    pub fn model_type(&self) -> ModelType {
+        if self.data.model_type.starts_with("embed") {
+            ModelType::Embedding
+        } else if self.data.model_type.starts_with("rerank") {
+            ModelType::Reranker
+        } else {
+            ModelType::Chat
+        }
     }
 
     pub fn data(&self) -> &ModelData {
@@ -124,7 +123,7 @@ impl Model {
 
     pub fn description(&self) -> String {
         match self.model_type() {
-            "chat" => {
+            ModelType::Chat => {
                 let ModelData {
                     max_input_tokens,
                     max_output_tokens,
@@ -155,7 +154,7 @@ impl Model {
                     max_input_tokens, max_output_tokens, input_price, output_price, capabilities
                 )
             }
-            "embedding" => {
+            ModelType::Embedding => {
                 let ModelData {
                     input_price,
                     max_tokens_per_chunk,
@@ -167,7 +166,7 @@ impl Model {
                 let price = format_option_value(input_price);
                 format!("max-tokens:{max_tokens};max-batch:{max_batch};price:{price}")
             }
-            _ => String::new(),
+            ModelType::Reranker => String::new(),
         }
     }
 
@@ -181,6 +180,14 @@ impl Model {
 
     pub fn supports_vision(&self) -> bool {
         self.data.supports_vision
+    }
+
+    pub fn no_stream(&self) -> bool {
+        self.data.no_stream
+    }
+
+    pub fn no_system_message(&self) -> bool {
+        self.data.no_system_message
     }
 
     pub fn max_tokens_per_chunk(&self) -> Option<usize> {
@@ -221,8 +228,26 @@ impl Model {
             .iter()
             .map(|v| match &v.content {
                 MessageContent::Text(text) => estimate_token_length(text),
-                MessageContent::Array(_) => 0,
-                MessageContent::ToolResults(_) => 0,
+                MessageContent::Array(list) => list
+                    .iter()
+                    .map(|v| match v {
+                        MessageContentPart::Text { text } => estimate_token_length(text),
+                        MessageContentPart::ImageUrl { .. } => 0,
+                    })
+                    .sum(),
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results, text, ..
+                }) => {
+                    estimate_token_length(text)
+                        + tool_results
+                            .iter()
+                            .map(|v| {
+                                serde_json::to_string(v)
+                                    .map(|v| estimate_token_length(&v))
+                                    .unwrap_or_default()
+                            })
+                            .sum::<usize>()
+                }
             })
             .sum()
     }
@@ -268,6 +293,10 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default)]
     pub supports_function_calling: bool,
+    #[serde(default)]
+    no_stream: bool,
+    #[serde(default)]
+    no_system_message: bool,
 
     // embedding-only properties
     pub max_tokens_per_chunk: Option<usize>,
@@ -279,17 +308,61 @@ impl ModelData {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            model_type: default_model_type(),
             ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct BuiltinModels {
+pub struct PredefinedModels {
     pub platform: String,
     pub models: Vec<ModelData>,
 }
 
 fn default_model_type() -> String {
     "chat".into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ModelType {
+    Chat,
+    Embedding,
+    Reranker,
+}
+
+impl Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelType::Chat => write!(f, "chat"),
+            ModelType::Embedding => write!(f, "embedding"),
+            ModelType::Reranker => write!(f, "reranker"),
+        }
+    }
+}
+
+impl ModelType {
+    pub fn can_create_from_name(self) -> bool {
+        match self {
+            ModelType::Chat => true,
+            ModelType::Embedding => false,
+            ModelType::Reranker => true,
+        }
+    }
+
+    pub fn api_name(self) -> &'static str {
+        match self {
+            ModelType::Chat => "chat_completions",
+            ModelType::Embedding => "embeddings",
+            ModelType::Reranker => "rerank",
+        }
+    }
+
+    pub fn extract_patch(self, patch: &RequestPatch) -> Option<&ApiPatch> {
+        match self {
+            ModelType::Chat => patch.chat_completions.as_ref(),
+            ModelType::Embedding => patch.embeddings.as_ref(),
+            ModelType::Reranker => patch.rerank.as_ref(),
+        }
+    }
 }

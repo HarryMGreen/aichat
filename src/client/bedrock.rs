@@ -67,7 +67,7 @@ impl BedrockClient {
         let body = build_chat_completions_body(data, &self.model)?;
 
         let mut request_data = RequestData::new("", body);
-        self.patch_request_data(&mut request_data, ApiType::ChatCompletions);
+        self.patch_request_data(&mut request_data);
         let RequestData {
             url: _,
             headers,
@@ -98,7 +98,7 @@ impl BedrockClient {
     fn embeddings_builder(
         &self,
         client: &ReqwestClient,
-        data: EmbeddingsData,
+        data: &EmbeddingsData,
     ) -> Result<RequestBuilder> {
         let access_key_id = self.get_access_key_id()?;
         let secret_access_key = self.get_secret_access_key()?;
@@ -118,7 +118,7 @@ impl BedrockClient {
         });
 
         let mut request_data = RequestData::new("", body);
-        self.patch_request_data(&mut request_data, ApiType::Embeddings);
+        self.patch_request_data(&mut request_data);
         let RequestData {
             url: _,
             headers,
@@ -173,7 +173,7 @@ impl Client for BedrockClient {
     async fn embeddings_inner(
         &self,
         client: &ReqwestClient,
-        data: EmbeddingsData,
+        data: &EmbeddingsData,
     ) -> Result<EmbeddingsOutput> {
         let builder = self.embeddings_builder(client, data)?;
         embeddings(builder).await
@@ -233,7 +233,7 @@ async fn chat_completions_streaming(
                                     if !function_name.is_empty() {
                                         let arguments: Value =
                                         function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' is invalid: arguments must be in valid JSON format")
+                                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                                         })?;
                                         handler.tool_call(ToolCall::new(
                                             function_name.clone(),
@@ -257,7 +257,7 @@ async fn chat_completions_streaming(
                         "contentBlockStop" => {
                             if !function_name.is_empty() {
                                 let arguments: Value = function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' is invalid: arguments must be in valid JSON format")
+                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                                 })?;
                                 handler.tool_call(ToolCall::new(
                                     function_name.clone(),
@@ -363,7 +363,9 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                         "content": content,
                     })]
                 }
-                MessageContent::ToolResults((tool_results, text)) => {
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results, text, ..
+                }) => {
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
                     if !text.is_empty() {

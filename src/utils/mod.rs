@@ -3,6 +3,7 @@ mod clipboard;
 mod command;
 mod crypto;
 mod html_to_md;
+mod loader;
 mod path;
 mod prompt_input;
 mod render_prompt;
@@ -15,6 +16,7 @@ pub use self::clipboard::set_text;
 pub use self::command::*;
 pub use self::crypto::*;
 pub use self::html_to_md::*;
+pub use self::loader::*;
 pub use self::path::*;
 pub use self::prompt_input::*;
 pub use self::render_prompt::render_prompt;
@@ -31,11 +33,15 @@ use unicode_segmentation::UnicodeSegmentation;
 lazy_static::lazy_static! {
     pub static ref CODE_BLOCK_RE: Regex = Regex::new(r"(?ms)```\w*(.*)```").unwrap();
     pub static ref IS_STDOUT_TERMINAL: bool = std::io::stdout().is_terminal();
+    pub static ref NO_COLOR: bool = env::var("NO_COLOR").ok().and_then(|v| parse_bool(&v)).unwrap_or_default() || !*IS_STDOUT_TERMINAL;
 }
 
 pub fn now() -> String {
-    let now = chrono::Local::now();
-    now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+pub fn now_timestamp() -> i64 {
+    chrono::Local::now().timestamp()
 }
 
 pub fn get_env_name(key: &str) -> String {
@@ -44,6 +50,14 @@ pub fn get_env_name(key: &str) -> String {
 
 pub fn normalize_env_name(value: &str) -> String {
     value.replace('-', "_").to_ascii_uppercase()
+}
+
+pub fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 pub fn estimate_token_length(text: &str) -> usize {
@@ -108,6 +122,14 @@ where
     }
 }
 
+pub fn convert_option_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 pub fn fuzzy_match(text: &str, pattern: &str) -> bool {
     let text_chars: Vec<char> = text.chars().collect();
     let pattern_chars: Vec<char> = pattern.chars().collect();
@@ -127,30 +149,53 @@ pub fn fuzzy_match(text: &str, pattern: &str) -> bool {
 
 pub fn pretty_error(err: &anyhow::Error) -> String {
     let mut output = vec![];
-    output.push(err.to_string());
-    output.push("Caused by:".to_string());
-    for (i, cause) in err.chain().skip(1).enumerate() {
-        output.push(format!("    {i}: {cause}"));
+    output.push(format!("Error: {err}"));
+    let causes: Vec<_> = err.chain().skip(1).collect();
+    let causes_len = causes.len();
+    if causes_len > 0 {
+        output.push("\nCaused by:".to_string());
+        if causes_len == 1 {
+            output.push(format!("    {}", indent_text(causes[0], 4).trim()));
+        } else {
+            for (i, cause) in causes.into_iter().enumerate() {
+                output.push(format!("{i:5}: {}", indent_text(cause, 7).trim()));
+            }
+        }
     }
-    output.push(String::new());
     output.join("\n")
 }
 
+pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
+    let indent_str = " ".repeat(size);
+    s.to_string()
+        .split('\n')
+        .map(|line| format!("{}{}", indent_str, line))
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
 pub fn error_text(input: &str) -> String {
-    nu_ansi_term::Style::new()
-        .fg(nu_ansi_term::Color::Red)
-        .paint(input)
-        .to_string()
+    color_text(input, nu_ansi_term::Color::Red)
 }
 
 pub fn warning_text(input: &str) -> String {
+    color_text(input, nu_ansi_term::Color::Yellow)
+}
+
+pub fn color_text(input: &str, color: nu_ansi_term::Color) -> String {
+    if *NO_COLOR {
+        return input.to_string();
+    }
     nu_ansi_term::Style::new()
-        .fg(nu_ansi_term::Color::Yellow)
+        .fg(color)
         .paint(input)
         .to_string()
 }
 
 pub fn dimmed_text(input: &str) -> String {
+    if *NO_COLOR {
+        return input.to_string();
+    }
     nu_ansi_term::Style::new().dimmed().paint(input).to_string()
 }
 
@@ -168,24 +213,17 @@ pub fn is_url(path: &str) -> bool {
 }
 
 pub fn set_proxy(
-    builder: reqwest::ClientBuilder,
+    mut builder: reqwest::ClientBuilder,
     proxy: Option<&String>,
 ) -> Result<reqwest::ClientBuilder> {
-    let proxy = if let Some(proxy) = proxy {
-        if proxy.is_empty() || proxy == "-" {
-            return Ok(builder);
+    if let Some(proxy) = proxy {
+        builder = builder.no_proxy();
+        if !proxy.is_empty() && proxy != "-" {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?,
+            );
         }
-        proxy.clone()
-    } else if let Some(proxy) = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .find_map(|v| env::var(v).ok())
-    {
-        proxy
-    } else {
-        return Ok(builder);
     };
-    let builder = builder
-        .proxy(reqwest::Proxy::all(&proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?);
     Ok(builder)
 }
 

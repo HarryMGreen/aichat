@@ -19,7 +19,7 @@ use tokio::sync::mpsc::unbounded_channel;
 const MODELS_YAML: &str = include_str!("../../models.yaml");
 
 lazy_static::lazy_static! {
-    pub static ref ALL_MODELS: Vec<BuiltinModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
+    pub static ref ALL_PREDEFINED_MODELS: Vec<PredefinedModels> = serde_yaml::from_str(MODELS_YAML).unwrap();
     static ref ESCAPE_SLASH_RE: Regex = Regex::new(r"(?<!\\)/").unwrap();
 }
 
@@ -43,6 +43,9 @@ pub trait Client: Sync + Send {
         let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
         let proxy = extra.and_then(|v| v.proxy.clone());
         builder = set_proxy(builder, proxy.as_ref())?;
+        if let Some(user_agent) = self.global_config().read().user_agent.as_ref() {
+            builder = builder.user_agent(user_agent);
+        }
         let client = builder
             .connect_timeout(Duration::from_secs(timeout))
             .build()
@@ -67,7 +70,7 @@ pub trait Client: Sync + Send {
         input: &Input,
         handler: &mut SseHandler,
     ) -> Result<()> {
-        let abort_signal = handler.get_abort();
+        let abort_signal = handler.abort();
         let input = input.clone();
         tokio::select! {
             ret = async {
@@ -87,21 +90,21 @@ pub trait Client: Sync + Send {
                 handler.done();
                 ret.with_context(|| "Failed to call chat-completions api")
             }
-            _ = watch_abort_signal(abort_signal) => {
+            _ = wait_abort_signal(&abort_signal) => {
                 handler.done();
                 Ok(())
             },
         }
     }
 
-    async fn embeddings(&self, data: EmbeddingsData) -> Result<Vec<Vec<f32>>> {
+    async fn embeddings(&self, data: &EmbeddingsData) -> Result<Vec<Vec<f32>>> {
         let client = self.build_client()?;
         self.embeddings_inner(&client, data)
             .await
             .context("Failed to call embeddings api")
     }
 
-    async fn rerank(&self, data: RerankData) -> Result<RerankOutput> {
+    async fn rerank(&self, data: &RerankData) -> Result<RerankOutput> {
         let client = self.build_client()?;
         self.rerank_inner(&client, data)
             .await
@@ -124,7 +127,7 @@ pub trait Client: Sync + Send {
     async fn embeddings_inner(
         &self,
         _client: &ReqwestClient,
-        _data: EmbeddingsData,
+        _data: &EmbeddingsData,
     ) -> Result<EmbeddingsOutput> {
         bail!("The client doesn't support embeddings api")
     }
@@ -132,7 +135,7 @@ pub trait Client: Sync + Send {
     async fn rerank_inner(
         &self,
         _client: &ReqwestClient,
-        _data: RerankData,
+        _data: &RerankData,
     ) -> Result<RerankOutput> {
         bail!("The client doesn't support rerank api")
     }
@@ -141,23 +144,23 @@ pub trait Client: Sync + Send {
         &self,
         client: &reqwest::Client,
         mut request_data: RequestData,
-        api_type: ApiType,
     ) -> RequestBuilder {
-        self.patch_request_data(&mut request_data, api_type);
+        self.patch_request_data(&mut request_data);
         request_data.into_builder(client)
     }
 
-    fn patch_request_data(&self, request_data: &mut RequestData, api_type: ApiType) {
+    fn patch_request_data(&self, request_data: &mut RequestData) {
+        let model_type = self.model().model_type();
         let map = std::env::var(get_env_name(&format!(
             "patch_{}_{}",
             self.model().client_name(),
-            api_type.name(),
+            model_type.api_name(),
         )))
         .ok()
         .and_then(|v| serde_json::from_str(&v).ok())
         .or_else(|| {
             self.patch_config()
-                .and_then(|v| api_type.extract_patch(v))
+                .and_then(|v| model_type.extract_patch(v))
                 .cloned()
         });
         let map = match map {
@@ -196,30 +199,6 @@ pub struct RequestPatch {
 }
 
 pub type ApiPatch = IndexMap<String, Value>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiType {
-    ChatCompletions,
-    Embeddings,
-    Rerank,
-}
-
-impl ApiType {
-    pub fn name(&self) -> &str {
-        match self {
-            ApiType::ChatCompletions => "chat_completions",
-            ApiType::Embeddings => "embeddings",
-            ApiType::Rerank => "rerank",
-        }
-    }
-    pub fn extract_patch<'a>(&self, patch: &'a RequestPatch) -> Option<&'a ApiPatch> {
-        match self {
-            ApiType::ChatCompletions => patch.chat_completions.as_ref(),
-            ApiType::Embeddings => patch.embeddings.as_ref(),
-            ApiType::Rerank => patch.rerank.as_ref(),
-        }
-    }
-}
 
 pub struct RequestData {
     pub url: String,
@@ -380,7 +359,7 @@ pub fn create_openai_compatible_client_config(client: &str) -> Result<Option<(St
                 config["api_base"] = api_base.into();
             }
             prompts.push(("api_key", "API Key:", false, PromptKind::String));
-            if !ALL_MODELS.iter().any(|v| v.platform == name) {
+            if !ALL_PREDEFINED_MODELS.iter().any(|v| v.platform == name) {
                 prompts.extend([
                     ("models[].name", "Model Name:", true, PromptKind::String),
                     (
@@ -401,20 +380,31 @@ pub fn create_openai_compatible_client_config(client: &str) -> Result<Option<(St
 
 pub async fn call_chat_completions(
     input: &Input,
+    extract_code: bool,
     client: &dyn Client,
-    config: &GlobalConfig,
+    abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
-    let task = client.chat_completions(input.clone());
-    let ret = run_with_spinner(task, "Generating").await;
+    let ret = abortable_run_with_spinner(
+        client.chat_completions(input.clone()),
+        "Generating",
+        abort_signal,
+    )
+    .await;
+
     match ret {
         Ok(ret) => {
             let ChatCompletionsOutput {
-                text, tool_calls, ..
+                mut text,
+                tool_calls,
+                ..
             } = ret;
             if !text.is_empty() {
-                config.read().print_markdown(&text)?;
+                if extract_code && text.trim_start().starts_with("```") {
+                    text = extract_block(&text);
+                }
+                client.global_config().read().print_markdown(&text)?;
             }
-            Ok((text, eval_tool_calls(config, tool_calls)?))
+            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
         }
         Err(err) => Err(err),
     }
@@ -423,16 +413,19 @@ pub async fn call_chat_completions(
 pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
-    config: &GlobalConfig,
-    abort: AbortSignal,
+    abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
-    let mut handler = SseHandler::new(tx, abort.clone());
+    let mut handler = SseHandler::new(tx, abort_signal.clone());
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, config, abort.clone()),
+        render_stream(rx, client.global_config(), abort_signal.clone()),
     );
+
+    if handler.abort().aborted() {
+        bail!("Aborted.");
+    }
 
     render_ret?;
 
@@ -442,7 +435,7 @@ pub async fn call_chat_completions_streaming(
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            Ok((text, eval_tool_calls(config, tool_calls)?))
+            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
         }
         Err(err) => {
             if !text.is_empty() {
@@ -470,7 +463,7 @@ where
     Ok(())
 }
 
-pub fn noop_prepare_embeddings<T>(_client: &T, _data: EmbeddingsData) -> Result<RequestData> {
+pub fn noop_prepare_embeddings<T>(_client: &T, _data: &EmbeddingsData) -> Result<RequestData> {
     bail!("The client doesn't support embeddings api")
 }
 
@@ -478,7 +471,7 @@ pub async fn noop_embeddings(_builder: RequestBuilder, _model: &Model) -> Result
     bail!("The client doesn't support embeddings api")
 }
 
-pub fn noop_prepare_rerank<T>(_client: &T, _data: RerankData) -> Result<RequestData> {
+pub fn noop_prepare_rerank<T>(_client: &T, _data: &RerankData) -> Result<RequestData> {
     bail!("The client doesn't support rerank api")
 }
 

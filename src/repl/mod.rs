@@ -8,13 +8,13 @@ use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{AssertState, Config, GlobalConfig, Input, StateFlags};
-use crate::function::need_send_tool_results;
 use crate::render::render_error;
-use crate::utils::{create_abort_signal, set_text, temp_file, AbortSignal};
+use crate::utils::{
+    abortable_run_with_spinner, create_abort_signal, set_text, temp_file, AbortSignal,
+};
 
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
-use nu_ansi_term::Color;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
@@ -23,15 +23,10 @@ use reedline::{
 use reedline::{MenuBuilder, Signal};
 use std::{env, process};
 
-lazy_static::lazy_static! {
-    static ref SPLIT_FILES_TEXT_ARGS_RE: Regex =
-        Regex::new(r"(?m) (-- |--\n|--\r\n|--\r|--$)").unwrap();
-}
-
 const MENU_NAME: &str = "completion_menu";
 
 lazy_static::lazy_static! {
-    static ref REPL_COMMANDS: [ReplCommand; 33] = [
+    static ref REPL_COMMANDS: [ReplCommand; 34] = [
         ReplCommand::new(".help", "Show this help message", AssertState::pass()),
         ReplCommand::new(".info", "View system info", AssertState::pass()),
         ReplCommand::new(".model", "Change the current LLM", AssertState::pass()),
@@ -53,7 +48,7 @@ lazy_static::lazy_static! {
         ReplCommand::new(
             ".edit role",
             "Edit the current role",
-            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION_EMPTY | StateFlags::SESSION),
+            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".save role",
@@ -63,7 +58,7 @@ lazy_static::lazy_static! {
         ReplCommand::new(
             ".exit role",
             "Leave the role",
-            AssertState::True(StateFlags::ROLE),
+            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".session",
@@ -71,8 +66,13 @@ lazy_static::lazy_static! {
             AssertState::False(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
         ReplCommand::new(
-            ".clear messages",
+            ".empty session",
             "Erase messages in the current session",
+            AssertState::True(StateFlags::SESSION)
+        ),
+        ReplCommand::new(
+            ".compress session",
+            "Compress messages in the current session",
             AssertState::True(StateFlags::SESSION)
         ),
         ReplCommand::new(
@@ -95,10 +95,36 @@ lazy_static::lazy_static! {
             "End the session",
             AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION)
         ),
+        ReplCommand::new(".agent", "Use a agent", AssertState::bare()),
+        ReplCommand::new(
+            ".starter",
+            "Use the conversation starter",
+            AssertState::True(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".variable",
+            "Set agent variable",
+            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION)
+        ),
+        ReplCommand::new(
+            ".info agent",
+            "View agent info",
+            AssertState::True(StateFlags::AGENT),
+        ),
+        ReplCommand::new(
+            ".exit agent",
+            "Leave the agent",
+            AssertState::True(StateFlags::AGENT)
+        ),
         ReplCommand::new(
             ".rag",
             "Init or use the RAG",
             AssertState::False(StateFlags::AGENT)
+        ),
+        ReplCommand::new(
+            ".edit rag-docs",
+            "Edit the RAG documents",
+            AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
         ReplCommand::new(
             ".rebuild rag",
@@ -120,32 +146,6 @@ lazy_static::lazy_static! {
             "Leave the RAG",
             AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
-        ReplCommand::new(".agent", "Use a agent", AssertState::bare()),
-        ReplCommand::new(
-            ".starter",
-            "Use the conversation starter",
-            AssertState::True(StateFlags::AGENT)
-        ),
-        ReplCommand::new(
-            ".variable",
-            "Set agent variable",
-            AssertState::True(StateFlags::AGENT)
-        ),
-        ReplCommand::new(
-            ".save agent-config",
-            "Save the current agent config to file",
-            AssertState::True(StateFlags::AGENT)
-        ),
-        ReplCommand::new(
-            ".info agent",
-            "View agent info",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".exit agent",
-            "Leave the agent",
-            AssertState::True(StateFlags::AGENT)
-        ),
         ReplCommand::new(
             ".file",
             "Include files with the message",
@@ -157,9 +157,9 @@ lazy_static::lazy_static! {
             "Regenerate the last response",
             AssertState::pass()
         ),
+        ReplCommand::new(".copy", "Copy the last response", AssertState::pass()),
         ReplCommand::new(".set", "Adjust runtime configuration", AssertState::pass()),
         ReplCommand::new(".delete", "Delete roles/sessions/RAGs/agents", AssertState::pass()),
-        ReplCommand::new(".copy", "Copy the last response", AssertState::pass()),
         ReplCommand::new(".exit", "Exit the REPL", AssertState::pass()),
     ];
     static ref COMMAND_RE: Regex = Regex::new(r"^\s*(\.\S*)\s*").unwrap();
@@ -189,7 +189,11 @@ impl Repl {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        self.banner();
+        if AssertState::False(StateFlags::AGENT | StateFlags::RAG)
+            .assert(self.config.read().state())
+        {
+            self.banner();
+        }
 
         loop {
             if self.abort_signal.aborted_ctrld() {
@@ -206,7 +210,7 @@ impl Repl {
                             }
                         }
                         Err(err) => {
-                            render_error(err, self.config.read().highlight);
+                            render_error(err);
                             println!()
                         }
                     }
@@ -222,7 +226,7 @@ impl Repl {
                 _ => {}
             }
         }
-        self.handle(".exit session").await?;
+        self.config.write().exit_session()?;
         Ok(())
     }
 
@@ -276,7 +280,7 @@ impl Repl {
                     Some(args) => match args.split_once(['\n', ' ']) {
                         Some((name, text)) => {
                             let role = self.config.read().retrieve_role(name.trim())?;
-                            let input = Input::from_str(&self.config, text.trim(), Some(role));
+                            let input = Input::from_str(&self.config, text, Some(role));
                             ask(&self.config, self.abort_signal.clone(), input, false).await?;
                         }
                         None => {
@@ -296,16 +300,22 @@ impl Repl {
                 },
                 ".session" => {
                     self.config.write().use_session(args)?;
+                    Config::maybe_autoname_session(self.config.clone());
                 }
                 ".rag" => {
                     Config::use_rag(&self.config, args, self.abort_signal.clone()).await?;
                 }
-                ".agent" => match args {
-                    Some(name) => {
-                        Config::use_agent(&self.config, name, None, self.abort_signal.clone())
-                            .await?;
+                ".agent" => match split_args(args) {
+                    Some((agent_name, session_name)) => {
+                        Config::use_agent(
+                            &self.config,
+                            agent_name,
+                            session_name,
+                            self.abort_signal.clone(),
+                        )
+                        .await?;
                     }
-                    None => println!(r#"Usage: .agent <name>"#),
+                    None => println!(r#"Usage: .agent <agent-name> [session-name]"#),
                 },
                 ".starter" => match args {
                     Some(value) => {
@@ -325,73 +335,81 @@ impl Repl {
                         println!("Usage: .variable <key> <value>")
                     }
                 },
-                ".save" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("role", name)) => {
-                            self.config.write().save_role(name)?;
-                        }
-                        Some(("session", name)) => {
-                            self.config.write().save_session(name)?;
-                        }
-                        Some(("agent-config", _)) => {
-                            self.config.write().save_agent_config()?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .save <role|session|aegnt-config> [name]"#)
-                        }
+                ".save" => match split_args(args) {
+                    Some(("role", name)) => {
+                        self.config.write().save_role(name)?;
                     }
-                }
-                ".edit" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("role", _)) => {
-                            self.config.write().edit_role()?;
-                        }
-                        Some(("session", _)) => {
-                            self.config.write().edit_session()?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .edit <role|session>"#)
-                        }
+                    Some(("session", name)) => {
+                        self.config.write().save_session(name)?;
                     }
-                }
-                ".rebuild" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("rag", _)) => {
-                            Config::rebuild_rag(&self.config, self.abort_signal.clone()).await?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .rebuild rag"#)
-                        }
+                    _ => {
+                        println!(r#"Usage: .save <role|session> [name]"#)
                     }
-                }
-                ".sources" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("rag", _)) => {
-                            let output = Config::rag_sources(&self.config)?;
-                            println!("{}", output);
-                        }
-                        _ => {
-                            println!(r#"Usage: .sources rag"#)
-                        }
+                },
+                ".edit" => match args {
+                    Some("role") => {
+                        self.config.write().edit_role()?;
                     }
-                }
+                    Some("session") => {
+                        self.config.write().edit_session()?;
+                    }
+                    Some("rag-docs") => {
+                        Config::edit_rag_docs(&self.config, self.abort_signal.clone()).await?;
+                    }
+                    _ => {
+                        println!(r#"Usage: .edit <role|session|rag-docs>"#)
+                    }
+                },
+                ".compress" => match args {
+                    Some("session") => {
+                        abortable_run_with_spinner(
+                            Config::compress_session(&self.config),
+                            "Compressing",
+                            self.abort_signal.clone(),
+                        )
+                        .await?;
+                        println!("✓ Successfully compressed the session.");
+                    }
+                    _ => {
+                        println!(r#"Usage: .compress session"#)
+                    }
+                },
+                ".empty" => match args {
+                    Some("session") => {
+                        self.config.write().empty_session()?;
+                    }
+                    _ => {
+                        println!(r#"Usage: .empty session"#)
+                    }
+                },
+                ".rebuild" => match args {
+                    Some("rag") => {
+                        Config::rebuild_rag(&self.config, self.abort_signal.clone()).await?;
+                    }
+                    _ => {
+                        println!(r#"Usage: .rebuild rag"#)
+                    }
+                },
+                ".sources" => match args {
+                    Some("rag") => {
+                        let output = Config::rag_sources(&self.config)?;
+                        println!("{}", output);
+                    }
+                    _ => {
+                        println!(r#"Usage: .sources rag"#)
+                    }
+                },
                 ".file" => match args {
                     Some(args) => {
-                        let (files, text) = split_files_text(args);
-                        let files = shell_words::split(files).with_context(|| "Invalid args")?;
-                        let input = Input::from_files(&self.config, text, files, None).await?;
+                        let (files, text) = split_files_text(args, cfg!(windows));
+                        let input = Input::from_files_with_spinner(
+                            &self.config,
+                            text,
+                            files,
+                            None,
+                            self.abort_signal.clone(),
+                        )
+                        .await?;
                         ask(&self.config, self.abort_signal.clone(), input, true).await?;
                     }
                     None => println!("Usage: .file <files>... [-- <text>...]"),
@@ -425,7 +443,7 @@ impl Repl {
                         Config::delete(&self.config, args)?;
                     }
                     _ => {
-                        println!("Usage: .delete [roles|sessions|rags|agents]")
+                        println!("Usage: .delete <role|session|rag|agent-data>")
                     }
                 },
                 ".copy" => {
@@ -438,7 +456,11 @@ impl Repl {
                         self.config.write().exit_role()?;
                     }
                     Some("session") => {
-                        self.config.write().exit_session()?;
+                        if self.config.read().agent.is_some() {
+                            self.config.write().exit_agent_session()?;
+                        } else {
+                            self.config.write().exit_session()?;
+                        }
                     }
                     Some("rag") => {
                         self.config.write().exit_rag()?;
@@ -453,7 +475,7 @@ impl Repl {
                 },
                 ".clear" => match args {
                     Some("messages") => {
-                        self.config.write().clear_session_messages()?;
+                        bail!("Use '.empty session' instead");
                     }
                     _ => unknown_command()?,
                 },
@@ -524,16 +546,6 @@ Type ".help" for additional help.
             KeyCode::Enter,
             ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
-        keybindings.add_binding(
-            KeyModifiers::SHIFT,
-            KeyCode::Enter,
-            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
-        );
-        keybindings.add_binding(
-            KeyModifiers::ALT,
-            KeyCode::Enter,
-            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
-        );
     }
 
     fn create_edit_mode(config: &GlobalConfig) -> Box<dyn EditMode> {
@@ -558,7 +570,7 @@ Type ".help" for additional help.
 
     fn copy(&self, text: &str) -> Result<()> {
         if text.is_empty() {
-            bail!("Empty text")
+            bail!("No text to copy")
         }
         set_text(text)?;
         Ok(())
@@ -582,15 +594,7 @@ impl ReplCommand {
     }
 
     fn is_valid(&self, flags: StateFlags) -> bool {
-        match self.state {
-            AssertState::True(true_flags) => true_flags & flags != StateFlags::empty(),
-            AssertState::False(false_flags) => false_flags & flags == StateFlags::empty(),
-            AssertState::TrueFalse(true_flags, false_flags) => {
-                (true_flags & flags != StateFlags::empty())
-                    && (false_flags & flags == StateFlags::empty())
-            }
-            AssertState::Equal(check_flags) => check_flags == flags,
-        }
+        self.state.assert(flags)
     }
 }
 
@@ -627,40 +631,25 @@ async fn ask(
 
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if config.read().stream {
-        call_chat_completions_streaming(&input, client.as_ref(), config, abort_signal.clone())
-            .await?
+    let (output, tool_results) = if input.stream() {
+        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     } else {
-        call_chat_completions(&input, client.as_ref(), config).await?
+        call_chat_completions(&input, false, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
         .after_chat_completion(&input, &output, &tool_results)?;
-    if need_send_tool_results(&tool_results) {
+    if !tool_results.is_empty() {
         ask(
             config,
             abort_signal,
-            input.merge_tool_call(output, tool_results),
+            input.merge_tool_results(output, tool_results),
             false,
         )
         .await
     } else {
-        if config.write().should_compress_session() {
-            let config = config.clone();
-            let color = if config.read().light_theme {
-                Color::LightGray
-            } else {
-                Color::DarkGray
-            };
-            print!(
-                "\n📢 {}\n",
-                color.italic().paint("Compressing the session."),
-            );
-            tokio::spawn(async move {
-                let _ = compress_session(&config).await;
-                config.write().end_compressing_session();
-            });
-        }
+        Config::maybe_autoname_session(config.clone());
+        Config::maybe_compress_session(config.clone());
         Ok(())
     }
 }
@@ -696,27 +685,83 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-async fn compress_session(config: &GlobalConfig) -> Result<()> {
-    let input = Input::from_str(config, config.read().summarize_prompt(), None);
-    let client = input.create_client()?;
-    let summary = client.chat_completions(input).await?.text;
-    config.write().compress_session(&summary);
-    Ok(())
+fn split_args(args: Option<&str>) -> Option<(&str, Option<&str>)> {
+    args.map(|v| match v.split_once(' ') {
+        Some((subcmd, args)) => (subcmd, Some(args.trim())),
+        None => (v, None),
+    })
 }
 
-fn split_files_text(args: &str) -> (&str, &str) {
-    match SPLIT_FILES_TEXT_ARGS_RE.find(args).ok().flatten() {
-        Some(mat) => {
-            let files = &args[0..mat.start()];
-            let text = if mat.end() < args.len() {
-                &args[mat.end()..]
-            } else {
-                ""
-            };
-            (files, text)
+fn split_files_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut unbalance: Option<char> = None;
+    let mut prev_char: Option<char> = None;
+    let mut text_starts_at = None;
+    let unquote_word = |word: &str| {
+        if ((word.starts_with('"') && word.ends_with('"'))
+            || (word.starts_with('\'') && word.ends_with('\'')))
+            && word.len() >= 2
+        {
+            word[1..word.len() - 1].to_string()
+        } else {
+            word.to_string()
         }
-        None => (args, ""),
+    };
+    let chars: Vec<char> = line.chars().collect();
+
+    for (i, char) in chars.iter().cloned().enumerate() {
+        match unbalance {
+            Some(ub_char) if ub_char == char => {
+                word.push(char);
+                unbalance = None;
+            }
+            Some(_) => {
+                word.push(char);
+            }
+            None => match char {
+                ' ' | '\t' | '\r' | '\n' => {
+                    if char == '\r' && chars.get(i + 1) == Some(&'\n') {
+                        continue;
+                    }
+                    if let Some('\\') = prev_char.filter(|_| !is_win) {
+                        word.push(char);
+                    } else if !word.is_empty() {
+                        if word == "--" {
+                            word.clear();
+                            text_starts_at = Some(i + 1);
+                            break;
+                        }
+                        words.push(unquote_word(&word));
+                        word.clear();
+                    }
+                }
+                '\'' | '"' => {
+                    word.push(char);
+                    unbalance = Some(char);
+                }
+                '\\' => {
+                    if is_win || prev_char.map(|c| c == '\\').unwrap_or_default() {
+                        word.push(char);
+                    }
+                }
+                _ => {
+                    word.push(char);
+                }
+            },
+        }
+        prev_char = Some(char);
     }
+
+    if !word.is_empty() && word != "--" {
+        words.push(unquote_word(&word));
+    }
+    let text = match text_starts_at {
+        Some(start) => &line[start..],
+        None => "",
+    };
+
+    (words, text)
 }
 
 #[cfg(test)]
@@ -744,20 +789,55 @@ mod tests {
 
     #[test]
     fn test_split_files_text() {
-        assert_eq!(split_files_text("file.txt"), ("file.txt", ""));
-        assert_eq!(split_files_text("file.txt --"), ("file.txt", ""));
-        assert_eq!(split_files_text("file.txt -- hello"), ("file.txt", "hello"));
         assert_eq!(
-            split_files_text("file.txt --\nhello"),
-            ("file.txt", "hello")
+            split_files_text("file.txt", false),
+            (vec!["file.txt".into()], "")
         );
         assert_eq!(
-            split_files_text("file.txt --\r\nhello"),
-            ("file.txt", "hello")
+            split_files_text("file.txt --", false),
+            (vec!["file.txt".into()], "")
         );
         assert_eq!(
-            split_files_text("file.txt --\rhello"),
-            ("file.txt", "hello")
+            split_files_text("file.txt -- hello", false),
+            (vec!["file.txt".into()], "hello")
+        );
+        assert_eq!(
+            split_files_text("file.txt -- \thello", false),
+            (vec!["file.txt".into()], "\thello")
+        );
+        assert_eq!(
+            split_files_text("file.txt --\nhello", false),
+            (vec!["file.txt".into()], "hello")
+        );
+        assert_eq!(
+            split_files_text("file.txt --\r\nhello", false),
+            (vec!["file.txt".into()], "hello")
+        );
+        assert_eq!(
+            split_files_text("file.txt --\rhello", false),
+            (vec!["file.txt".into()], "hello")
+        );
+        assert_eq!(
+            split_files_text(r#"file1.txt 'file2.txt' "file3.txt""#, false),
+            (
+                vec!["file1.txt".into(), "file2.txt".into(), "file3.txt".into()],
+                ""
+            )
+        );
+        assert_eq!(
+            split_files_text(r#"./file1.txt 'file1 - Copy.txt' file\ 2.txt"#, false),
+            (
+                vec![
+                    "./file1.txt".into(),
+                    "file1 - Copy.txt".into(),
+                    "file 2.txt".into()
+                ],
+                ""
+            )
+        );
+        assert_eq!(
+            split_files_text(r#".\file.txt C:\dir\file.txt"#, true),
+            (vec![".\\file.txt".into(), "C:\\dir\\file.txt".into()], "")
         );
     }
 }

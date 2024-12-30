@@ -1,7 +1,7 @@
 # ---- llm ----
 model: openai:gpt-4o             # Specify the LLM to use
-temperature: null                # Set default temperature parameter
-top_p: null                      # Set default top-p parameter, range (0, 1)
+temperature: null                # Set default temperature parameter (0, 1)
+top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
 
 # ---- behavior ----
 stream: true                     # Controls whether to use the stream-style API.
@@ -19,7 +19,7 @@ mapping_tools:                   # Alias for a tool or toolset
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
 
 # ---- prelude ----
-prelude: null                    # Set a default role or session to start with (e.g. role:<name>, session:<name>)
+prelude: null                    # Set a default role or session to start with (e.g. role:<name>, session:<name>, <session>:<role>)
 repl_prelude: null               # Overrides the `prelude` setting specifically for conversations started in REPL
 agent_prelude: null              # Set a session to use when starting a agent. (e.g. temp, default)
 
@@ -37,26 +37,32 @@ summary_prompt: 'This is a summary of the chat history as a recap: '
 # See [RAG-Guide](https://github.com/sigoden/aichat/wiki/RAG-Guide) for more details.
 rag_embedding_model: null                   # Specifies the embedding model to use
 rag_reranker_model: null                    # Specifies the rerank model to use
-rag_top_k: 4                                # Specifies the number of documents to retrieve
+rag_top_k: 5                                # Specifies the number of documents to retrieve
 rag_chunk_size: null                        # Specifies the chunk size
 rag_chunk_overlap: null                     # Specifies the chunk overlap
 rag_min_score_vector_search: 0              # Specifies the minimum relevance score for vector-based searching
 rag_min_score_keyword_search: 0             # Specifies the minimum relevance score for keyword-based searching
 # Defines the query structure using variables like __CONTEXT__ and __INPUT__ to tailor searches to specific needs
 rag_template: |
-  Use the following context as your learned knowledge, inside <context></context> XML tags.
+  Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
+
   <context>
   __CONTEXT__
   </context>
 
-  When answer to user:
-  - If you don't know, just say that you don't know.
-  - If you don't know when you are not sure, ask for clarification.
-  Avoid mentioning that you obtained the information from the context.
-  And answer according to the language of the user's question.
+  <rules>
+  - If you don't know, just say so.
+  - If you are not sure, ask for clarification.
+  - Answer in the same language as the user query.
+  - If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
+  - If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
+  - Answer directly and without using xml tags.
+  </rules>
 
-  Given the context information, answer the query.
-  Query: __INPUT__
+  <user_query>
+  __INPUT__
+  </user_query>
+
 # Define document loaders to control how RAG and `.file`/`--file` load files of specific formats.
 document_loaders:
   # You can add custom loaders using the following syntax:
@@ -76,6 +82,8 @@ right_prompt:
 
 # ---- misc ----
 serve_addr: 127.0.0.1:8000                  # Default serve listening address 
+user_agent: null                            # Set User-Agent HTTP header, use `auto` for aichat/<current-version>
+save_shell_history: true                    # Whether to save shell execution command to the history file
 
 # ---- clients ----
 clients:
@@ -159,6 +167,12 @@ clients:
     api_base: https://api.mistral.ai/v1
     api_key: xxx
 
+  # See https://docs.x.ai/docs
+  - type: openai-compatible
+    name: xai
+    api_base: https://api.x.ai/v1
+    api_key: xxx
+
   # See https://docs.ai21.com/docs/quickstart
   - type: openai-compatible
     name: ai12
@@ -167,7 +181,7 @@ clients:
 
   # See https://docs.cohere.com/docs/the-cohere-platform
   - type: cohere
-    api_base: https://api.cohere.ai/v1                # Optional
+    api_base: https://api.cohere.ai/v2                # Optional
     api_key: xxx
 
   # See https://docs.perplexity.ai/docs/getting-started
@@ -201,10 +215,10 @@ clients:
   - type: vertexai
     project_id: xxx
     location: xxx
-    # Specifies a application-default-credentials (adc) file, Optional field
+    # Specifies a application-default-credentials (adc) file
     # Run `gcloud auth application-default login` to init the adc file
     # see https://cloud.google.com/docs/authentication/external/set-up-adc
-    adc_file: <path-to/gcloud/application_default_credentials.json> 
+    adc_file: <gcloud-config-dir>/application_default_credentials.json>  # Optional field
     patch:
       chat_completions:
         'gemini-.*':
@@ -231,25 +245,21 @@ clients:
     api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
     api_key: xxx
 
-  # See https://huggingface.co/inference-api/serverless
-  - type: openai-compatible
-    name: huggingface
-    api_base: https://api-inference.huggingface.co/v1
-    api_key: xxx
-
-  # See https://replicate.com/docs
-  - type: replicate
-    api_key: xxx
-
   # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
   - type: ernie
     api_key: xxx
     secret_key: xxx
 
-  # See https://help.aliyun.com/zh/dashscope/
+  # See https://dashscope.aliyun.com/
   - type: openai-compatible
     name: qianwen
     api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: xxx
+
+  # See https://cloud.tencent.com/product/hunyuan
+  - type: openai-compatible
+    name: hunyuan
+    api_base: https://api.hunyuan.cloud.tencent.com/v1
     api_key: xxx
 
   # See https://platform.moonshot.cn/docs/intro
@@ -298,12 +308,6 @@ clients:
   - type: openai-compatible
     name: openrouter
     api_base: https://openrouter.ai/api/v1
-    api_key: xxx
-
-  # See https://octo.ai/docs/getting-started/quickstart
-  - type: openai-compatible
-    name: octoai
-    api_base: https://text.octoai.run/v1
     api_key: xxx
 
   # See https://docs.siliconflow.cn/docs/getting-started

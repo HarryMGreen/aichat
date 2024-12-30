@@ -45,7 +45,7 @@ impl Client for VertexAIClient {
         let model = self.model();
         let model_category = ModelCategory::from_str(model.name())?;
         let request_data = prepare_chat_completions(self, data, &model_category)?;
-        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        let builder = self.request_builder(client, request_data);
         match model_category {
             ModelCategory::Gemini => gemini_chat_completions(builder, model).await,
             ModelCategory::Claude => claude_chat_completions(builder, model).await,
@@ -63,7 +63,7 @@ impl Client for VertexAIClient {
         let model = self.model();
         let model_category = ModelCategory::from_str(model.name())?;
         let request_data = prepare_chat_completions(self, data, &model_category)?;
-        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        let builder = self.request_builder(client, request_data);
         match model_category {
             ModelCategory::Gemini => {
                 gemini_chat_completions_streaming(builder, handler, model).await
@@ -80,11 +80,11 @@ impl Client for VertexAIClient {
     async fn embeddings_inner(
         &self,
         client: &ReqwestClient,
-        data: EmbeddingsData,
+        data: &EmbeddingsData,
     ) -> Result<Vec<Vec<f32>>> {
         prepare_gcloud_access_token(client, self.name(), &self.config.adc_file).await?;
         let request_data = prepare_embeddings(self, data)?;
-        let builder = self.request_builder(client, request_data, ApiType::Embeddings);
+        let builder = self.request_builder(client, request_data);
         embeddings(builder, self.model()).await
     }
 }
@@ -148,7 +148,7 @@ fn prepare_chat_completions(
     Ok(request_data)
 }
 
-fn prepare_embeddings(self_: &VertexAIClient, data: EmbeddingsData) -> Result<RequestData> {
+fn prepare_embeddings(self_: &VertexAIClient, data: &EmbeddingsData) -> Result<RequestData> {
     let project_id = self_.get_project_id()?;
     let location = self_.get_location()?;
     let access_token = get_access_token(self_.name())?;
@@ -156,11 +156,7 @@ fn prepare_embeddings(self_: &VertexAIClient, data: EmbeddingsData) -> Result<Re
     let base_url = format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers");
     let url = format!("{base_url}/google/models/{}:predict", self_.model.name());
 
-    let instances: Vec<_> = data
-        .texts
-        .into_iter()
-        .map(|v| json!({"content": v}))
-        .collect();
+    let instances: Vec<_> = data.texts.iter().map(|v| json!({"content": v})).collect();
 
     let body = json!({
         "instances": instances,
@@ -201,24 +197,25 @@ pub async fn gemini_chat_completions_streaming(
         let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
-            if let Some(text) = data["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                if !text.is_empty() {
-                    handler.text(text)?;
-                }
-            } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
-                .as_str()
-                .or_else(|| data["candidates"][0]["finishReason"].as_str())
-            {
-                bail!("Content Blocked")
-            } else if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
-                for part in parts {
-                    if let (Some(name), Some(args)) = (
+            if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
+                for (i, part) in parts.iter().enumerate() {
+                    if let Some(text) = part["text"].as_str() {
+                        if i > 0 {
+                            handler.text("\n\n")?;
+                        }
+                        handler.text(text)?;
+                    } else if let (Some(name), Some(args)) = (
                         part["functionCall"]["name"].as_str(),
                         part["functionCall"]["args"].as_object(),
                     ) {
                         handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
                     }
                 }
+            } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
+                .as_str()
+                .or_else(|| data["candidates"][0]["finishReason"].as_str())
+            {
+                bail!("Blocked due to safety")
             }
 
             Ok(())
@@ -261,38 +258,35 @@ struct EmbeddingsResBodyPredictionEmbeddings {
 }
 
 fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
-    let text = data["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-
+    let mut text_parts = vec![];
     let mut tool_calls = vec![];
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
-        tool_calls = parts
-            .iter()
-            .filter_map(|part| {
-                if let (Some(name), Some(args)) = (
-                    part["functionCall"]["name"].as_str(),
-                    part["functionCall"]["args"].as_object(),
-                ) {
-                    Some(ToolCall::new(name.to_string(), json!(args), None))
-                } else {
-                    None
-                }
-            })
-            .collect()
+        for part in parts {
+            if let Some(text) = part["text"].as_str() {
+                text_parts.push(text);
+            }
+            if let (Some(name), Some(args)) = (
+                part["functionCall"]["name"].as_str(),
+                part["functionCall"]["args"].as_object(),
+            ) {
+                tool_calls.push(ToolCall::new(name.to_string(), json!(args), None));
+            }
+        }
     }
+
+    let text = text_parts.join("\n\n");
     if text.is_empty() && tool_calls.is_empty() {
         if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
             .as_str()
             .or_else(|| data["candidates"][0]["finishReason"].as_str())
         {
-            bail!("Content Blocked")
+            bail!("Blocked due to safety")
         } else {
             bail!("Invalid response data: {data}");
         }
     }
     let output = ChatCompletionsOutput {
-        text: text.to_string(),
+        text,
         tool_calls,
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
@@ -313,12 +307,7 @@ pub fn gemini_build_chat_completions_body(
         stream: _,
     } = data;
 
-    let system_message = if model.name().starts_with("gemini-1.5-") {
-        extract_system_message(&mut messages)
-    } else {
-        patch_system_message(&mut messages);
-        None
-    };
+    let system_message = extract_system_message(&mut messages);
 
     let mut network_image_urls = vec![];
     let contents: Vec<Value> = messages
@@ -351,7 +340,7 @@ pub fn gemini_build_chat_completions_body(
                             .collect();
                         vec![json!({ "role": role, "parts": parts })]
                     },
-                    MessageContent::ToolResults((tool_results, _)) => {
+                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
                         let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
                             json!({
                                 "functionCall": {

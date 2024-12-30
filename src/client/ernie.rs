@@ -41,7 +41,7 @@ impl Client for ErnieClient {
     ) -> Result<ChatCompletionsOutput> {
         prepare_access_token(self, client).await?;
         let request_data = prepare_chat_completions(self, data)?;
-        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        let builder = self.request_builder(client, request_data);
         chat_completions(builder, &self.model).await
     }
 
@@ -53,25 +53,29 @@ impl Client for ErnieClient {
     ) -> Result<()> {
         prepare_access_token(self, client).await?;
         let request_data = prepare_chat_completions(self, data)?;
-        let builder = self.request_builder(client, request_data, ApiType::ChatCompletions);
+        let builder = self.request_builder(client, request_data);
         chat_completions_streaming(builder, handler, &self.model).await
     }
 
     async fn embeddings_inner(
         &self,
         client: &ReqwestClient,
-        data: EmbeddingsData,
+        data: &EmbeddingsData,
     ) -> Result<EmbeddingsOutput> {
         prepare_access_token(self, client).await?;
         let request_data = prepare_embeddings(self, data)?;
-        let builder = self.request_builder(client, request_data, ApiType::Embeddings);
+        let builder = self.request_builder(client, request_data);
         embeddings(builder, &self.model).await
     }
 
-    async fn rerank_inner(&self, client: &ReqwestClient, data: RerankData) -> Result<RerankOutput> {
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
         prepare_access_token(self, client).await?;
         let request_data = prepare_rerank(self, data)?;
-        let builder = self.request_builder(client, request_data, ApiType::Rerank);
+        let builder = self.request_builder(client, request_data);
         rerank(builder, &self.model).await
     }
 }
@@ -91,7 +95,7 @@ fn prepare_chat_completions(self_: &ErnieClient, data: ChatCompletionsData) -> R
     Ok(request_data)
 }
 
-fn prepare_embeddings(self_: &ErnieClient, data: EmbeddingsData) -> Result<RequestData> {
+fn prepare_embeddings(self_: &ErnieClient, data: &EmbeddingsData) -> Result<RequestData> {
     let access_token = get_access_token(self_.name())?;
 
     let url = format!(
@@ -108,7 +112,7 @@ fn prepare_embeddings(self_: &ErnieClient, data: EmbeddingsData) -> Result<Reque
     Ok(request_data)
 }
 
-fn prepare_rerank(self_: &ErnieClient, data: RerankData) -> Result<RequestData> {
+fn prepare_rerank(self_: &ErnieClient, data: &RerankData) -> Result<RequestData> {
     let access_token = get_access_token(self_.name())?;
 
     let url = format!(
@@ -171,7 +175,7 @@ async fn chat_completions_streaming(
                 function.get("arguments").and_then(|v| v.as_str()),
             ) {
                 let arguments: Value = arguments.parse().with_context(|| {
-                    format!("Tool call '{name}' is invalid: arguments must be in valid JSON format")
+                    format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
                 })?;
                 handler.tool_call(ToolCall::new(name.to_string(), arguments, None))?;
             }
@@ -227,7 +231,9 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Valu
         .flat_map(|message| {
             let Message { role, content } = message;
             match content {
-                MessageContent::ToolResults((tool_results, _)) => {
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results,  ..
+                }) => {
                     let mut list = vec![];
                     for tool_result in tool_results {
                         list.push(json!({
@@ -286,7 +292,7 @@ fn extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> 
             call.get("arguments").and_then(|v| v.as_str()),
         ) {
             let arguments: Value = arguments.parse().with_context(|| {
-                format!("Tool call '{name}' is invalid: arguments must be in valid JSON format")
+                format!("Tool call '{name}' have non-JSON arguments '{arguments}'")
             })?;
             tool_calls.push(ToolCall::new(name.to_string(), arguments, None));
         }

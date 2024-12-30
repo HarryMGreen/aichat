@@ -15,14 +15,20 @@ pub struct Cli {
     /// Start or join a session
     #[clap(short = 's', long)]
     pub session: Option<Option<String>>,
-    /// Forces the session to be saved
+    /// Ensure the session is empty
+    #[clap(long)]
+    pub empty_session: bool,
+    /// Ensure the new conversation is saved to the session
     #[clap(long)]
     pub save_session: bool,
     /// Start a agent
     #[clap(short = 'a', long)]
     pub agent: Option<String>,
+    /// Set agent variables
+    #[clap(long, value_names = ["NAME", "VALUE"], num_args = 2)]
+    pub agent_variable: Vec<String>,
     /// Start a RAG
-    #[clap(short = 'R', long)]
+    #[clap(long)]
     pub rag: Option<String>,
     /// Serve the LLM API and WebAPP
     #[clap(long, value_name = "ADDRESS")]
@@ -67,12 +73,7 @@ pub struct Cli {
 
 impl Cli {
     pub fn text(&self) -> Option<String> {
-        let text = self
-            .text
-            .iter()
-            .map(|x| x.trim().to_string())
-            .collect::<Vec<String>>()
-            .join(" ");
+        let text = self.text.to_vec().join(" ");
         if text.is_empty() {
             return None;
         }

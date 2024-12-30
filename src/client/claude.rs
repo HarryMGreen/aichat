@@ -95,7 +95,7 @@ pub async fn claude_chat_completions_streaming(
                         if !function_name.is_empty() {
                             let arguments: Value =
                                 function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' is invalid: arguments must be in valid JSON format")
+                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                                 })?;
                             handler.tool_call(ToolCall::new(
                                 function_name.clone(),
@@ -124,7 +124,7 @@ pub async fn claude_chat_completions_streaming(
                             json!({})
                         } else {
                             function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' is invalid: arguments must be in valid JSON format")
+                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
                             })?
                         };
                         handler.tool_call(ToolCall::new(
@@ -202,7 +202,9 @@ pub fn claude_build_chat_completions_body(
                         "content": content,
                     })]
                 }
-                MessageContent::ToolResults((tool_results, text)) => {
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results, text, ..
+                }) => {
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
                     if !text.is_empty() {
