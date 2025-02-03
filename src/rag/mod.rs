@@ -297,19 +297,11 @@ impl Rag {
         &self,
         text: &str,
         top_k: usize,
-        min_score_vector_search: f32,
-        min_score_keyword_search: f32,
         rerank_model: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<(String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
-            self.hybird_search(
-                text,
-                top_k,
-                min_score_vector_search,
-                min_score_keyword_search,
-                rerank_model,
-            ),
+            self.hybird_search(text, top_k, rerank_model),
             "Searching",
             abort_signal,
         )
@@ -497,13 +489,11 @@ impl Rag {
         &self,
         query: &str,
         top_k: usize,
-        min_score_vector_search: f32,
-        min_score_keyword_search: f32,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
         let (vector_search_results, keyword_search_results) = tokio::join!(
-            self.vector_search(query, top_k, min_score_vector_search),
-            self.keyword_search(query, top_k, min_score_keyword_search)
+            self.vector_search(query, top_k, 0.0),
+            self.keyword_search(query, top_k, 0.0),
         );
 
         let vector_search_results = vector_search_results?;
@@ -850,6 +840,24 @@ fn select_embedding_model(models: &[&Model]) -> Result<String> {
         .collect();
     let result = Select::new("Select embedding model:", models).prompt()?;
     Ok(result.value)
+}
+
+#[derive(Debug)]
+struct SelectOption {
+    pub value: String,
+    pub description: String,
+}
+
+impl SelectOption {
+    pub fn new(value: String, description: String) -> Self {
+        Self { value, description }
+    }
+}
+
+impl std::fmt::Display for SelectOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.value, self.description)
+    }
 }
 
 fn set_chunk_size(model: &Model) -> Result<usize> {

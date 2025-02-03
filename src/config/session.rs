@@ -234,8 +234,7 @@ impl Session {
                     }
                     MessageRole::User => {
                         lines.push(format!(
-                            "{}）{}",
-                            self.name,
+                            ">> {}",
                             message.content.render_input(resolve_url_fn, agent_info)
                         ));
                     }
@@ -439,7 +438,7 @@ impl Session {
         })?;
 
         if is_repl {
-            println!("✓ Saved session to '{}'.", session_path.display());
+            println!("✓ Saved the session to '{}'.", session_path.display());
         }
 
         if self.name() != session_name {

@@ -35,13 +35,11 @@ summary_prompt: 'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
 # See [RAG-Guide](https://github.com/sigoden/aichat/wiki/RAG-Guide) for more details.
-rag_embedding_model: null                   # Specifies the embedding model to use
-rag_reranker_model: null                    # Specifies the rerank model to use
-rag_top_k: 5                                # Specifies the number of documents to retrieve
-rag_chunk_size: null                        # Specifies the chunk size
-rag_chunk_overlap: null                     # Specifies the chunk overlap
-rag_min_score_vector_search: 0              # Specifies the minimum relevance score for vector-based searching
-rag_min_score_keyword_search: 0             # Specifies the minimum relevance score for keyword-based searching
+rag_embedding_model: null        # Specifies the embedding model used for context retrieval
+rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents
+rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
+rag_chunk_size: null             # Defines the size of chunks for document processing in characters
+rag_chunk_overlap: null          # Defines the overlap between chunks
 # Defines the query structure using variables like __CONTEXT__ and __INPUT__ to tailor searches to specific needs
 rag_template: |
   Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
@@ -81,9 +79,11 @@ right_prompt:
   '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
 
 # ---- misc ----
-serve_addr: 127.0.0.1:8000                  # Default serve listening address 
+serve_addr: 127.0.0.1:8000                  # Server listening address 
 user_agent: null                            # Set User-Agent HTTP header, use `auto` for aichat/<current-version>
 save_shell_history: true                    # Whether to save shell execution command to the history file
+# URL to sync model changes from, e.g., https://cdn.jsdelivr.net/gh/sigoden/aichat@main/models.yaml
+sync_models_url: https://raw.githubusercontent.com/sigoden/aichat/refs/heads/main/models.yaml
 
 # ---- clients ----
 clients:
@@ -246,9 +246,10 @@ clients:
     api_key: xxx
 
   # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
-  - type: ernie
+  - type: openai-compatible
+    name: ernie
+    api_base: https://qianfan.baidubce.com/v2
     api_key: xxx
-    secret_key: xxx
 
   # See https://dashscope.aliyun.com/
   - type: openai-compatible
@@ -286,6 +287,12 @@ clients:
     api_base: https://api.lingyiwanwu.com/v1
     api_key: xxx
 
+  # See https://platform.minimaxi.com/document/Fast%20access
+  - type: openai-compatible
+    name: minimax
+    api_base: https://api.minimax.chat/v1
+    api_key: xxx
+
   # See https://deepinfra.com/docs
   - type: openai-compatible
     name: deepinfra
@@ -320,6 +327,18 @@ clients:
   - type: openai-compatible
     name: together
     api_base: https://api.together.xyz/v1
+    api_key: xxx
+
+  # See https://docs.hyperbolic.xyz/docs/getting-started
+  - type: openai-compatible
+    name: hyperbolic
+    api_base: https://api.hyperbolic.xyz/v1
+    api_key: xxx
+  
+  # See https://novita.ai/docs/guides/introduction
+  - type: openai-compatible
+    name: novita
+    api_base: https://api.novita.ai/v3/openai
     api_key: xxx
 
   # ----- RAG dedicated -----

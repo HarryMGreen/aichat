@@ -5,7 +5,6 @@ mod crypto;
 mod html_to_md;
 mod loader;
 mod path;
-mod prompt_input;
 mod render_prompt;
 mod request;
 mod spinner;
@@ -18,7 +17,6 @@ pub use self::crypto::*;
 pub use self::html_to_md::*;
 pub use self::loader::*;
 pub use self::path::*;
-pub use self::prompt_input::*;
 pub use self::render_prompt::render_prompt;
 pub use self::request::*;
 pub use self::spinner::*;
@@ -26,6 +24,7 @@ pub use self::variables::*;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
 use std::{env, path::PathBuf, process};
 use unicode_segmentation::UnicodeSegmentation;
@@ -112,16 +111,6 @@ pub fn extract_block(input: &str) -> String {
     }
 }
 
-pub fn format_option_value<T>(value: &Option<T>) -> String
-where
-    T: std::fmt::Display,
-{
-    match value {
-        Some(value) => value.to_string(),
-        None => "-".to_string(),
-    }
-}
-
 pub fn convert_option_string(value: &str) -> Option<String> {
     if value.is_empty() {
         None
@@ -130,21 +119,20 @@ pub fn convert_option_string(value: &str) -> Option<String> {
     }
 }
 
-pub fn fuzzy_match(text: &str, pattern: &str) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-
-    let mut pattern_index = 0;
-    let mut text_index = 0;
-
-    while pattern_index < pattern_chars.len() && text_index < text_chars.len() {
-        if pattern_chars[pattern_index] == text_chars[text_index] {
-            pattern_index += 1;
-        }
-        text_index += 1;
-    }
-
-    pattern_index == pattern_chars.len()
+pub fn fuzzy_filter<T, F>(values: Vec<T>, get: F, pattern: &str) -> Vec<T>
+where
+    F: Fn(&T) -> &str,
+{
+    let matcher = SkimMatcherV2::default();
+    let mut list: Vec<(T, i64)> = values
+        .into_iter()
+        .filter_map(|v| {
+            let score = matcher.fuzzy_match(get(&v), pattern)?;
+            Some((v, score))
+        })
+        .collect();
+    list.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    list.into_iter().map(|(v, _)| v).collect()
 }
 
 pub fn pretty_error(err: &anyhow::Error) -> String {
@@ -199,6 +187,21 @@ pub fn dimmed_text(input: &str) -> String {
     nu_ansi_term::Style::new().dimmed().paint(input).to_string()
 }
 
+pub fn multiline_text(input: &str) -> String {
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(i, v)| {
+            if i == 0 {
+                v.to_string()
+            } else {
+                format!(".. {v}")
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
 pub fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
     env::temp_dir().join(format!(
         "{}-{}{prefix}{}{suffix}",
@@ -230,13 +233,6 @@ pub fn set_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_fuzzy_match() {
-        assert!(fuzzy_match("openai:gpt-4-turbo", "gpt4"));
-        assert!(fuzzy_match("openai:gpt-4-turbo", "oai4"));
-        assert!(!fuzzy_match("openai:gpt-4-turbo", "4gpt"));
-    }
 
     #[test]
     #[cfg(not(target_os = "windows"))]

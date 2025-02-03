@@ -5,7 +5,7 @@ use super::{
 };
 
 use crate::config::Config;
-use crate::utils::{estimate_token_length, format_option_value};
+use crate::utils::estimate_token_length;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -133,10 +133,10 @@ impl Model {
                     supports_function_calling,
                     ..
                 } = &self.data;
-                let max_input_tokens = format_option_value(max_input_tokens);
-                let max_output_tokens = format_option_value(max_output_tokens);
-                let input_price = format_option_value(input_price);
-                let output_price = format_option_value(output_price);
+                let max_input_tokens = stringify_option_value(max_input_tokens);
+                let max_output_tokens = stringify_option_value(max_output_tokens);
+                let input_price = stringify_option_value(input_price);
+                let output_price = stringify_option_value(output_price);
                 let mut capabilities = vec![];
                 if *supports_vision {
                     capabilities.push('👁');
@@ -161,9 +161,9 @@ impl Model {
                     max_batch_size,
                     ..
                 } = &self.data;
-                let max_tokens = format_option_value(max_tokens_per_chunk);
-                let max_batch = format_option_value(max_batch_size);
-                let price = format_option_value(input_price);
+                let max_tokens = stringify_option_value(max_tokens_per_chunk);
+                let max_batch = stringify_option_value(max_batch_size);
+                let price = stringify_option_value(input_price);
                 format!("max-tokens:{max_tokens};max-batch:{max_batch};price:{price}")
             }
             ModelType::Reranker => String::new(),
@@ -176,10 +176,6 @@ impl Model {
 
     pub fn max_output_tokens(&self) -> Option<isize> {
         self.data.max_output_tokens
-    }
-
-    pub fn supports_vision(&self) -> bool {
-        self.data.supports_vision
     }
 
     pub fn no_stream(&self) -> bool {
@@ -281,26 +277,33 @@ pub struct ModelData {
     pub name: String,
     #[serde(default = "default_model_type", rename = "type")]
     pub model_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
 
     // chat-only properties
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<isize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_max_tokens: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_vision: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_function_calling: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_system_message: bool,
 
     // embedding-only properties
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens_per_chunk: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_chunk_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<usize>,
 }
 
@@ -314,9 +317,9 @@ impl ModelData {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PredefinedModels {
-    pub platform: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModels {
+    pub provider: String,
     pub models: Vec<ModelData>,
 }
 
@@ -364,5 +367,15 @@ impl ModelType {
             ModelType::Embedding => patch.embeddings.as_ref(),
             ModelType::Reranker => patch.rerank.as_ref(),
         }
+    }
+}
+
+fn stringify_option_value<T>(value: &Option<T>) -> String
+where
+    T: std::fmt::Display,
+{
+    match value {
+        Some(value) => value.to_string(),
+        None => "-".to_string(),
     }
 }

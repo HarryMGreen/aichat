@@ -68,7 +68,7 @@ impl Agent {
 
         let rag = if rag_path.exists() {
             Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
-        } else if !definition.documents.is_empty() && !config.read().cli_info_flag {
+        } else if !definition.documents.is_empty() && !config.read().info_flag {
             let mut ans = false;
             if *IS_STDOUT_TERMINAL {
                 ans = Confirm::new("The agent has the documents, init RAG?")
@@ -237,10 +237,6 @@ impl Agent {
         self.config.agent_prelude.as_deref()
     }
 
-    pub fn set_agent_prelude(&mut self, value: Option<String>) {
-        self.config.agent_prelude = value;
-    }
-
     pub fn variables(&self) -> &AgentVariables {
         match &self.session_variables {
             Some(variables) => variables,
@@ -274,27 +270,6 @@ impl Agent {
 
     pub fn set_session_variables(&mut self, session_variables: AgentVariables) {
         self.session_variables = Some(session_variables);
-    }
-
-    pub fn set_variable(&mut self, key: &str, value: &str) -> Result<()> {
-        let variables = match self.session_variables.as_mut() {
-            Some(v) => v,
-            None => &mut self.shared_variables,
-        };
-        let Some(old_value) = variables.get(key) else {
-            bail!("Unknown variable '{key}'")
-        };
-        if old_value == value {
-            return Ok(());
-        }
-        variables.insert(key.to_string(), value.to_string());
-        if self.session_variables.is_some() {
-            self.update_session_dynamic_instructions(None)?;
-        } else {
-            self.update_shared_dynamic_instructions(true)?;
-        }
-
-        Ok(())
     }
 
     pub fn defined_variables(&self) -> &[AgentVariable] {
@@ -554,6 +529,27 @@ pub fn list_agents() -> Vec<String> {
             } else {
                 Some(line.to_string())
             }
+        })
+        .collect()
+}
+
+pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
+    let index_path = Config::agent_functions_dir(agent_name).join("index.yaml");
+    if !index_path.exists() {
+        return vec![];
+    }
+    let Ok(definition) = AgentDefinition::load(&index_path) else {
+        return vec![];
+    };
+    definition
+        .variables
+        .iter()
+        .map(|v| {
+            let description = match &v.default {
+                Some(default) => format!("{} [default: {default}]", v.description),
+                None => v.description.clone(),
+            };
+            (format!("{}=", v.name), Some(description))
         })
         .collect()
 }

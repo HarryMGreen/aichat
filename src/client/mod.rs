@@ -7,7 +7,6 @@ mod model;
 mod stream;
 
 pub use crate::function::ToolCall;
-pub use crate::utils::PromptKind;
 pub use common::*;
 pub use message::*;
 pub use model::*;
@@ -32,23 +31,29 @@ register_client!(
     ),
     (vertexai, "vertexai", VertexAIConfig, VertexAIClient),
     (bedrock, "bedrock", BedrockConfig, BedrockClient),
-    (ernie, "ernie", ErnieConfig, ErnieClient),
 );
 
-pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 21] = [
+pub const OPENAI_COMPATIBLE_PROVIDERS: [(&str, &str); 25] = [
     ("ai21", "https://api.ai21.com/studio/v1"),
-    ("cloudflare", ""),
+    (
+        "cloudflare",
+        "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
+    ),
     ("deepinfra", "https://api.deepinfra.com/v1/openai"),
     ("deepseek", "https://api.deepseek.com"),
+    ("ernie", "https://qianfan.baidubce.com/v2"),
     ("fireworks", "https://api.fireworks.ai/inference/v1"),
     ("github", "https://models.inference.ai.azure.com"),
     ("groq", "https://api.groq.com/openai/v1"),
     ("hunyuan", "https://api.hunyuan.cloud.tencent.com/v1"),
+    ("hyperbolic", "https://api.hyperbolic.xyz/v1"),
     ("lingyiwanwu", "https://api.lingyiwanwu.com/v1"),
+    ("minimax", "https://api.minimax.chat/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
     ("moonshot", "https://api.moonshot.cn/v1"),
+    ("novita", "https://api.novita.ai/v3/openai"),
     ("openrouter", "https://openrouter.ai/api/v1"),
-    ("ollama", ""),
+    ("ollama", "http://{OLLAMA_HOST}:11434/v1"),
     ("perplexity", "https://api.perplexity.ai"),
     (
         "qianwen",
