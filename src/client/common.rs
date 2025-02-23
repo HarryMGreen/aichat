@@ -10,11 +10,13 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
 use indexmap::IndexMap;
-use inquire::{required, Text};
+use inquire::{
+    list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
+};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
 const MODELS_YAML: &str = include_str!("../../models.yaml");
@@ -23,6 +25,7 @@ lazy_static::lazy_static! {
     pub static ref ALL_PROVIDER_MODELS: Vec<ProviderModels> = {
         Config::loal_models_override().ok().unwrap_or_else(|| serde_yaml::from_str(MODELS_YAML).unwrap())
     };
+    static ref EMBEDDING_MODEL_RE: Regex = Regex::new(r"((^|/)(bge-|e5-|uae-|gte-|text-)|embed|multilingual|minilm)").unwrap();
     static ref ESCAPE_SLASH_RE: Regex = Regex::new(r"(?<!\\)/").unwrap();
 }
 
@@ -44,8 +47,9 @@ pub trait Client: Sync + Send {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
         let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
-        let proxy = extra.and_then(|v| v.proxy.clone());
-        builder = set_proxy(builder, proxy.as_ref())?;
+        if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
+            builder = set_proxy(builder, proxy)?;
+        }
         if let Some(user_agent) = self.global_config().read().user_agent.as_ref() {
             builder = builder.user_agent(user_agent);
         }
@@ -150,7 +154,11 @@ pub trait Client: Sync + Send {
 
     fn patch_request_data(&self, request_data: &mut RequestData) {
         let model_type = self.model().model_type();
-        let map = std::env::var(get_env_name(&format!(
+        if let Some(patch) = self.model().patch() {
+            request_data.apply_patch(patch.clone());
+        }
+
+        let patch_map = std::env::var(get_env_name(&format!(
             "patch_{}_{}",
             self.model().client_name(),
             model_type.api_name(),
@@ -162,11 +170,11 @@ pub trait Client: Sync + Send {
                 .and_then(|v| model_type.extract_patch(v))
                 .cloned()
         });
-        let map = match map {
+        let patch_map = match patch_map {
             Some(v) => v,
             _ => return,
         };
-        for (key, patch) in map {
+        for (key, patch) in patch_map {
             let key = ESCAPE_SLASH_RE.replace_all(&key, r"\/");
             if let Ok(regex) = Regex::new(&format!("^({key})$")) {
                 if let Ok(true) = regex.is_match(self.model().name()) {
@@ -256,6 +264,8 @@ impl RequestData {
             for (key, value) in patch_headers {
                 if let Some(value) = value.as_str() {
                     self.header(key, value)
+                } else if value.is_null() {
+                    self.headers.swap_remove(key);
                 }
             }
         }
@@ -330,16 +340,29 @@ pub struct RerankResult {
 
 pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>);
 
-pub fn create_config(prompts: &[PromptAction], client: &str) -> Result<(String, Value)> {
+pub async fn create_config(
+    prompts: &[PromptAction<'static>],
+    client: &str,
+) -> Result<(String, Value)> {
     let mut config = json!({
         "type": client,
     });
-    set_client_config(prompts, &mut config, client)?;
+    for (key, desc, help_message) in prompts {
+        let env_name = format!("{client}_{key}").to_ascii_uppercase();
+        let required = std::env::var(&env_name).is_err();
+        let value = prompt_input_string(desc, required, *help_message)?;
+        if !value.is_empty() {
+            config[key] = value.into();
+        }
+    }
+    let model = set_client_models_config(&mut config, client).await?;
     let clients = json!(vec![config]);
-    Ok((client.to_string(), clients))
+    Ok((model, clients))
 }
 
-pub fn create_openai_compatible_client_config(client: &str) -> Result<Option<(String, Value)>> {
+pub async fn create_openai_compatible_client_config(
+    client: &str,
+) -> Result<Option<(String, Value)>> {
     let api_base = super::OPENAI_COMPATIBLE_PROVIDERS
         .into_iter()
         .find(|(name, _)| client == *name)
@@ -370,13 +393,14 @@ pub fn create_openai_compatible_client_config(client: &str) -> Result<Option<(St
         config["api_key"] = api_key.into();
     }
 
-    set_client_models_config(&mut config, &name)?;
+    let model = set_client_models_config(&mut config, &name).await?;
     let clients = json!(vec![config]);
-    Ok(Some((name, clients)))
+    Ok(Some((model, clients)))
 }
 
 pub async fn call_chat_completions(
     input: &Input,
+    print: bool,
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
@@ -396,10 +420,12 @@ pub async fn call_chat_completions(
                 ..
             } = ret;
             if !text.is_empty() {
-                if extract_code && text.trim_start().starts_with("```") {
-                    text = extract_block(&text);
+                if extract_code {
+                    text = extract_code_block(&text).to_string();
                 }
-                client.global_config().read().print_markdown(&text)?;
+                if print {
+                    client.global_config().read().print_markdown(&text)?;
+                }
             }
             Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
         }
@@ -441,23 +467,6 @@ pub async fn call_chat_completions_streaming(
             Err(err)
         }
     }
-}
-
-#[allow(unused)]
-pub async fn chat_completions_as_streaming<F, Fut>(
-    builder: RequestBuilder,
-    handler: &mut SseHandler,
-    f: F,
-) -> Result<()>
-where
-    F: FnOnce(RequestBuilder) -> Fut,
-    Fut: Future<Output = Result<String>>,
-{
-    let text = f(builder).await?;
-    handler.text(&text)?;
-    handler.done();
-
-    Ok(())
 }
 
 pub fn noop_prepare_embeddings<T>(_client: &T, _data: &EmbeddingsData) -> Result<RequestData> {
@@ -525,34 +534,119 @@ pub fn json_str_from_map<'a>(
     map.get(field_name).and_then(|v| v.as_str())
 }
 
-fn set_client_config(list: &[PromptAction], client_config: &mut Value, client: &str) -> Result<()> {
-    for (key, desc, help_message) in list {
-        let env_name = format!("{client}_{key}").to_ascii_uppercase();
-        let required = std::env::var(&env_name).is_err();
-        let value = prompt_input_string(desc, required, *help_message)?;
-        if !value.is_empty() {
-            client_config[key] = value.into();
+async fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<String> {
+    if let Some(provider) = ALL_PROVIDER_MODELS.iter().find(|v| v.provider == client) {
+        let models: Vec<String> = provider
+            .models
+            .iter()
+            .filter(|v| v.model_type == "chat")
+            .map(|v| v.name.clone())
+            .collect();
+        let model_name = select_model(models)?;
+        return Ok(format!("{client}:{model_name}"));
+    }
+    let mut model_names = vec![];
+    if let (Some(true), Some(api_base), api_key) = (
+        client_config["type"]
+            .as_str()
+            .map(|v| v == OpenAICompatibleClient::NAME),
+        client_config["api_base"].as_str(),
+        client_config["api_key"]
+            .as_str()
+            .map(|v| v.to_string())
+            .or_else(|| {
+                let env_name = format!("{client}_api_key").to_ascii_uppercase();
+                std::env::var(&env_name).ok()
+            }),
+    ) {
+        match abortable_run_with_spinner(
+            fetch_models(api_base, api_key.as_deref()),
+            "Fetching models",
+            create_abort_signal(),
+        )
+        .await
+        {
+            Ok(fetched_models) => {
+                model_names = MultiSelect::new("LLMs to include (required):", fetched_models)
+                    .with_validator(|list: &[ListOption<&String>]| {
+                        if list.is_empty() {
+                            Ok(Validation::Invalid(
+                                "At least one item must be selected".into(),
+                            ))
+                        } else {
+                            Ok(Validation::Valid)
+                        }
+                    })
+                    .prompt()?;
+            }
+            Err(err) => {
+                eprintln!("✗ Fetch models failed: {err}");
+            }
         }
     }
-    set_client_models_config(client_config, client)
-}
-
-fn set_client_models_config(client_config: &mut Value, client: &str) -> Result<()> {
-    if ALL_PROVIDER_MODELS.iter().any(|v| v.provider == client) {
-        return Ok(());
-    }
-
-    let model_names = prompt_input_string(
-        "LLM models",
-        true,
-        Some("Separated by commas, e.g. llama3.3,qwen2.5"),
-    )?;
-    let models: Vec<Value> = model_names
+    if model_names.is_empty() {
+        model_names = prompt_input_string(
+            "LLMs to add",
+            true,
+            Some("Separated by commas, e.g. llama3.3,qwen2.5"),
+        )?
         .split(',')
-        .map(|v| json!({"name": v.trim()}))
+        .filter_map(|v| {
+            let v = v.trim();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    }
+    if model_names.is_empty() {
+        bail!("No models");
+    }
+    let models: Vec<Value> = model_names
+        .iter()
+        .map(|v| {
+            let l = v.to_lowercase();
+            if l.contains("rank") {
+                json!({
+                    "name": v,
+                    "type": "reranker",
+                })
+            } else if let Ok(true) = EMBEDDING_MODEL_RE.is_match(&l) {
+                json!({
+                    "name": v,
+                    "type": "embedding",
+                    "default_chunk_size": 1000,
+                    "max_batch_size": 100
+                })
+            } else if v.contains("vision") {
+                json!({
+                    "name": v,
+                    "supports_vision": true
+                })
+            } else {
+                json!({
+                    "name": v,
+                })
+            }
+        })
         .collect();
     client_config["models"] = models.into();
-    Ok(())
+    let model_name = select_model(model_names)?;
+    Ok(format!("{client}:{model_name}"))
+}
+
+fn select_model(model_names: Vec<String>) -> Result<String> {
+    if model_names.is_empty() {
+        bail!("No models");
+    }
+    let model = if model_names.len() == 1 {
+        model_names[0].clone()
+    } else {
+        Select::new("Default Model (required):", model_names).prompt()?
+    };
+    Ok(model)
 }
 
 fn prompt_input_string(

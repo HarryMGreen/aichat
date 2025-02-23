@@ -242,7 +242,7 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    pub fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
+    pub async fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
         let config_path = Self::config_file();
         let mut config = if !config_path.exists() {
             match env::var(get_env_name("provider"))
@@ -252,7 +252,7 @@ impl Config {
                 Some(v) => Self::load_dynamic(&v)?,
                 None => {
                     if *IS_STDOUT_TERMINAL {
-                        create_config_file(&config_path)?;
+                        create_config_file(&config_path).await?;
                     }
                     Self::load_from_file(&config_path)?
                 }
@@ -1262,8 +1262,7 @@ impl Config {
             .clone()
             .unwrap_or_else(|| SUMMARIZE_PROMPT.into());
         let input = Input::from_str(config, &prompt, None);
-        let client = input.create_client()?;
-        let summary = client.chat_completions(input).await?.text;
+        let summary = input.fetch_chat_text().await?;
         let summary_prompt = config
             .read()
             .summary_prompt
@@ -1322,8 +1321,7 @@ impl Config {
         };
         let role = config.read().retrieve_role(CREATE_TITLE_ROLE)?;
         let input = Input::from_str(config, &text, Some(role));
-        let client = input.create_client()?;
-        let text = client.chat_completions(input).await?.text;
+        let text = input.fetch_chat_text().await?;
         if let Some(session) = config.write().session.as_mut() {
             session.set_autoname(&text);
         }
@@ -2074,7 +2072,7 @@ impl Config {
             return Ok(());
         }
         let mut file = self.open_message_file()?;
-        if output.is_empty() || !self.save {
+        if output.is_empty() && input.tool_calls().is_none() {
             return Ok(());
         }
         let now = now();
@@ -2606,7 +2604,7 @@ impl AssertState {
     }
 }
 
-fn create_config_file(config_path: &Path) -> Result<()> {
+async fn create_config_file(config_path: &Path) -> Result<()> {
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
         .prompt()?;
@@ -2617,7 +2615,7 @@ fn create_config_file(config_path: &Path) -> Result<()> {
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
     let mut config = serde_json::json!({});
-    let (model, clients_config) = create_client_config(client)?;
+    let (model, clients_config) = create_client_config(client).await?;
     config["model"] = model.into();
     config[CLIENTS_FIELD] = clients_config;
 

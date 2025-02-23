@@ -26,11 +26,13 @@ use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
+use std::borrow::Cow;
 use std::{env, path::PathBuf, process};
 use unicode_segmentation::UnicodeSegmentation;
 
 lazy_static::lazy_static! {
     pub static ref CODE_BLOCK_RE: Regex = Regex::new(r"(?ms)```\w*(.*)```").unwrap();
+    pub static ref THINK_TAG_RE: Regex = Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap();
     pub static ref IS_STDOUT_TERMINAL: bool = std::io::stdout().is_terminal();
     pub static ref NO_COLOR: bool = env::var("NO_COLOR").ok().and_then(|v| parse_bool(&v)).unwrap_or_default() || !*IS_STDOUT_TERMINAL;
 }
@@ -95,20 +97,16 @@ pub fn light_theme_from_colorfgbg(colorfgbg: &str) -> Option<bool> {
     Some(light)
 }
 
-pub fn extract_block(input: &str) -> String {
-    let output: String = CODE_BLOCK_RE
-        .captures_iter(input)
-        .filter_map(|m| {
-            m.ok()
-                .and_then(|cap| cap.get(1))
-                .map(|m| String::from(m.as_str()))
-        })
-        .collect();
-    if output.is_empty() {
-        input.trim().to_string()
-    } else {
-        output.trim().to_string()
-    }
+pub fn strip_think_tag(text: &str) -> Cow<str> {
+    THINK_TAG_RE.replace_all(text, "")
+}
+
+pub fn extract_code_block(text: &str) -> &str {
+    CODE_BLOCK_RE
+        .captures(text)
+        .ok()
+        .and_then(|v| v?.get(1).map(|v| v.as_str().trim()))
+        .unwrap_or(text)
 }
 
 pub fn convert_option_string(value: &str) -> Option<String> {
@@ -217,15 +215,12 @@ pub fn is_url(path: &str) -> bool {
 
 pub fn set_proxy(
     mut builder: reqwest::ClientBuilder,
-    proxy: Option<&String>,
+    proxy: &str,
 ) -> Result<reqwest::ClientBuilder> {
-    if let Some(proxy) = proxy {
-        builder = builder.no_proxy();
-        if !proxy.is_empty() && proxy != "-" {
-            builder = builder.proxy(
-                reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?,
-            );
-        }
+    builder = builder.no_proxy();
+    if !proxy.is_empty() && proxy != "-" {
+        builder = builder
+            .proxy(reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?);
     };
     Ok(builder)
 }

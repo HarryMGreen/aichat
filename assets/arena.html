@@ -870,6 +870,7 @@
               });
             }
           }
+          sanitizeMessages(messages);
           const body = {
             model: chat.model,
             messages: messages,
@@ -991,6 +992,20 @@
       });
     }
 
+    function sanitizeMessages(messages) {
+      let messagesLen = messages.length;
+      for (let i = 0; i < messagesLen; i++) {
+        const message = messages[i];
+        if (typeof message.content === "string" && message.role === "assistant" && i !== messagesLen - 1) {
+          message.content = stripThinkTag(message.content);
+        }
+      }
+    }
+
+    function stripThinkTag(text) {
+      return text.replace(/^\s*<think>([\s\S]*?)<\/think>(\s*|$)/g, '')
+    }
+
     function setupMarked() {
       const renderer = {
         code({ text, lang }) {
@@ -1009,8 +1024,39 @@
 </div>`;
         }
       };
+      const thinkExtension = {
+        name: 'think',
+        level: 'block',
+        start(src) {
+          const match = /^(\s*)<think>/.exec(src);
+          if (match) {
+            return match[1].length
+          } else {
+            return -1;
+          }
+        },
+        tokenizer(src, tokens) {
+          const rule = /^\s*<think>([\s\S]*?)(<\/think>|$)/;
+          const match = rule.exec(src);
+          if (match) {
+            return {
+              type: 'think',
+              raw: match[0],
+              text: match[1].trim(),
+            };
+          }
+        },
+        renderer(token) {
+          const text = '<p>' + token.text.trim().replace(/\n+/g, '</p><p>') + '</p>';
+          return `<details open class="think">
+            <summary>Deeply thought</summary>
+            <blockquote>${text}</blockquote>
+          </details>`;
+        },
+      };
       marked.use({ renderer });
-      marked.use(markedKatex({ throwOnError: false, inlineTolerantNoSpace: true  }));
+      marked.use(markedKatex({ throwOnError: false, inlineTolerantNoSpace: true }));
+      marked.use({ extensions: [thinkExtension] })
     }
 
     function escapeForHTML(input) {

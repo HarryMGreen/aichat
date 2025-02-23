@@ -52,12 +52,12 @@ macro_rules! register_client {
                 pub fn list_models(local_config: &$config) -> Vec<Model> {
                     let client_name = Self::name(local_config);
                     if local_config.models.is_empty() {
-                        if let Some(models) = $crate::client::ALL_PROVIDER_MODELS.iter().find(|v| {
+                        if let Some(v) = $crate::client::ALL_PROVIDER_MODELS.iter().find(|v| {
                             v.provider == $name ||
                                 ($name == OpenAICompatibleClient::NAME
                                     && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
                         }) {
-                            return Model::from_config(client_name, &models.models);
+                            return Model::from_config(client_name, &v.models);
                         }
                         vec![]
                     } else {
@@ -87,13 +87,13 @@ macro_rules! register_client {
             client_types
         }
 
-        pub fn create_client_config(client: &str) -> anyhow::Result<(String, serde_json::Value)> {
+        pub async fn create_client_config(client: &str) -> anyhow::Result<(String, serde_json::Value)> {
             $(
                 if client == $client::NAME && client != $crate::client::OpenAICompatibleClient::NAME {
-                    return create_config(&$client::PROMPTS, $client::NAME)
+                    return create_config(&$client::PROMPTS, $client::NAME).await
                 }
             )+
-            if let Some(ret) = create_openai_compatible_client_config(client)? {
+            if let Some(ret) = create_openai_compatible_client_config(client).await? {
                 return Ok(ret);
             }
             anyhow::bail!("Unknown client '{}'", client)

@@ -5,10 +5,11 @@ use super::{
 };
 
 use crate::config::Config;
-use crate::utils::estimate_token_length;
+use crate::utils::{estimate_token_length, strip_think_tag};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::Display;
 
 const PER_MESSAGES_TOKENS: usize = 5;
@@ -103,6 +104,10 @@ impl Model {
         &self.data.name
     }
 
+    pub fn real_name(&self) -> &str {
+        self.data.real_name.as_deref().unwrap_or(&self.data.name)
+    }
+
     pub fn model_type(&self) -> ModelType {
         if self.data.model_type.starts_with("embed") {
             ModelType::Embedding
@@ -170,6 +175,10 @@ impl Model {
         }
     }
 
+    pub fn patch(&self) -> Option<&Value> {
+        self.data.patch.as_ref()
+    }
+
     pub fn max_input_tokens(&self) -> Option<usize> {
         self.data.max_input_tokens
     }
@@ -184,6 +193,10 @@ impl Model {
 
     pub fn no_system_message(&self) -> bool {
         self.data.no_system_message
+    }
+
+    pub fn system_prompt_prefix(&self) -> Option<&str> {
+        self.data.system_prompt_prefix.as_deref()
     }
 
     pub fn max_tokens_per_chunk(&self) -> Option<usize> {
@@ -220,10 +233,18 @@ impl Model {
     }
 
     pub fn messages_tokens(&self, messages: &[Message]) -> usize {
+        let messages_len = messages.len();
         messages
             .iter()
-            .map(|v| match &v.content {
-                MessageContent::Text(text) => estimate_token_length(text),
+            .enumerate()
+            .map(|(i, v)| match &v.content {
+                MessageContent::Text(text) => {
+                    if v.role.is_assistant() && i != messages_len - 1 {
+                        estimate_token_length(&strip_think_tag(text))
+                    } else {
+                        estimate_token_length(text)
+                    }
+                }
                 MessageContent::Array(list) => list
                     .iter()
                     .map(|v| match v {
@@ -278,11 +299,15 @@ pub struct ModelData {
     #[serde(default = "default_model_type", rename = "type")]
     pub model_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Value>,
 
     // chat-only properties
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +322,8 @@ pub struct ModelData {
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_system_message: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt_prefix: Option<String>,
 
     // embedding-only properties
     #[serde(skip_serializing_if = "Option::is_none")]

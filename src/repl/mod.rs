@@ -262,7 +262,7 @@ Type ".help" for additional help.
             .with_ansi_colors(true);
 
         if let Ok(cmd) = config.read().editor() {
-            let temp_file = temp_file("-repl-", ".txt");
+            let temp_file = temp_file("-repl-", ".md");
             let command = process::Command::new(cmd);
             editor = editor.with_buffer_editor(command, temp_file);
         }
@@ -579,14 +579,15 @@ pub async fn run_repl_command(
                     ask(config, abort_signal.clone(), input, true).await?;
                 }
                 None => println!(
-                    r#"Usage: .file <file|dir|url|%%|cmd>... [-- <text>...]
+                    r#"Usage: .file <file|dir|url|cmd|loader:resource|%%>... [-- <text>...]
 
 .file /tmp/file.txt
 .file src/ Cargo.toml -- analyze
 .file https://example.com/file.txt -- summarize
 .file https://example.com/image.png -- recognize text
-.file %% -- translate last reply to english
-.file `git diff` -- Generate git commit message"#
+.file `git diff` -- Generate git commit message
+.file jina:https://example.com
+.file %% -- translate last reply to english"#
                 ),
             },
             ".continue" => {
@@ -713,7 +714,7 @@ async fn ask(
     let (output, tool_results) = if input.stream() {
         call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     } else {
-        call_chat_completions(&input, false, client.as_ref(), abort_signal.clone()).await?
+        call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
