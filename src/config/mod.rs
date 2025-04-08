@@ -116,8 +116,8 @@ pub struct Config {
     pub mapping_tools: IndexMap<String, String>,
     pub use_tools: Option<String>,
 
-    pub prelude: Option<String>,
     pub repl_prelude: Option<String>,
+    pub cmd_prelude: Option<String>,
     pub agent_prelude: Option<String>,
 
     pub save_session: Option<bool>,
@@ -192,8 +192,8 @@ impl Default for Config {
             mapping_tools: Default::default(),
             use_tools: None,
 
-            prelude: None,
             repl_prelude: None,
+            cmd_prelude: None,
             agent_prelude: None,
 
             save_session: None,
@@ -591,7 +591,7 @@ impl Config {
             ("use_tools", format_option_value(&role.use_tools())),
             (
                 "max_output_tokens",
-                self.model
+                role.model()
                     .max_tokens_param()
                     .map(|v| format!("{v} (current model)"))
                     .unwrap_or_else(|| "null".into()),
@@ -867,7 +867,7 @@ impl Config {
 
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
-        role.set_model(&self.model);
+        role.set_model(self.current_model());
         self.use_role_obj(role)
     }
 
@@ -923,16 +923,17 @@ impl Config {
         } else {
             Role::builtin(name)?
         };
+        let current_model = self.current_model();
         match role.model_id() {
             Some(model_id) => {
-                if self.model.id() != model_id {
+                if current_model.id() != model_id {
                     let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
                     role.set_model(&model);
                 } else {
-                    role.set_model(&self.model);
+                    role.set_model(current_model);
                 }
             }
-            None => role.set_model(&self.model),
+            None => role.set_model(current_model),
         }
         Ok(role)
     }
@@ -1605,8 +1606,8 @@ impl Config {
             return Ok(());
         }
         let prelude = match self.working_mode {
-            WorkingMode::Cmd => self.prelude.as_ref(),
-            WorkingMode::Repl => self.repl_prelude.as_ref().or(self.prelude.as_ref()),
+            WorkingMode::Repl => self.repl_prelude.as_ref(),
+            WorkingMode::Cmd => self.cmd_prelude.as_ref(),
             WorkingMode::Serve => return Ok(()),
         };
         let prelude = match prelude {
@@ -1795,7 +1796,7 @@ impl Config {
             };
         } else if cmd == ".set" && args.len() == 2 {
             let candidates = match args[0] {
-                "max_output_tokens" => match self.model.max_output_tokens() {
+                "max_output_tokens" => match self.current_model().max_output_tokens() {
                     Some(v) => vec![v.to_string()],
                     None => vec![],
                 },
@@ -2279,11 +2280,11 @@ impl Config {
             self.use_tools = v;
         }
 
-        if let Some(v) = read_env_value::<String>(&get_env_name("prelude")) {
-            self.prelude = v;
-        }
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
             self.repl_prelude = v;
+        }
+        if let Some(v) = read_env_value::<String>(&get_env_name("cmd_prelude")) {
+            self.cmd_prelude = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("agent_prelude")) {
             self.agent_prelude = v;
