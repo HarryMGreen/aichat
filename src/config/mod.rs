@@ -39,6 +39,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
+use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
 
 pub const TEMP_ROLE_NAME: &str = "%%";
 pub const TEMP_RAG_NAME: &str = "temp";
@@ -136,7 +137,7 @@ pub struct Config {
     pub document_loaders: HashMap<String, String>,
 
     pub highlight: bool,
-    pub light_theme: bool,
+    pub theme: Option<String>,
     pub left_prompt: Option<String>,
     pub right_prompt: Option<String>,
 
@@ -211,7 +212,7 @@ impl Default for Config {
             document_loaders: Default::default(),
 
             highlight: true,
-            light_theme: false,
+            theme: None,
             left_prompt: None,
             right_prompt: None,
 
@@ -523,7 +524,7 @@ impl Config {
     }
 
     pub fn extract_role(&self) -> Role {
-        let mut role = if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.as_ref() {
             session.to_role()
         } else if let Some(agent) = self.agent.as_ref() {
             agent.to_role()
@@ -538,14 +539,7 @@ impl Config {
                 self.use_tools.clone(),
             );
             role
-        };
-        if role.temperature().is_none() && self.temperature.is_some() {
-            role.set_temperature(self.temperature);
         }
-        if role.top_p().is_none() && self.top_p.is_some() {
-            role.set_top_p(self.top_p);
-        }
-        role
     }
 
     pub fn info(&self) -> Result<String> {
@@ -611,7 +605,7 @@ impl Config {
             ("wrap", wrap),
             ("wrap_code", self.wrap_code.to_string()),
             ("highlight", self.highlight.to_string()),
-            ("light_theme", self.light_theme.to_string()),
+            ("theme", format_option_value(&self.theme)),
             ("config_file", display_path(&Self::config_file())),
             ("env_file", display_path(&Self::env_file())),
             ("roles_dir", display_path(&Self::roles_dir())),
@@ -849,15 +843,21 @@ impl Config {
 
     pub fn set_max_output_tokens(&mut self, value: Option<isize>) {
         match self.role_like_mut() {
-            Some(role_like) => role_like.model_mut().set_max_tokens(value, true),
-            None => self.model.set_max_tokens(value, true),
+            Some(role_like) => {
+                let mut model = role_like.model().clone();
+                model.set_max_tokens(value, true);
+                role_like.set_model(model);
+            }
+            None => {
+                self.model.set_max_tokens(value, true);
+            }
         };
     }
 
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
         let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
         match self.role_like_mut() {
-            Some(role_like) => role_like.set_model(&model),
+            Some(role_like) => role_like.set_model(model),
             None => {
                 self.model = model;
             }
@@ -867,7 +867,7 @@ impl Config {
 
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut role = Role::new(TEMP_ROLE_NAME, prompt);
-        role.set_model(self.current_model());
+        role.set_model(self.current_model().clone());
         self.use_role_obj(role)
     }
 
@@ -923,17 +923,25 @@ impl Config {
         } else {
             Role::builtin(name)?
         };
-        let current_model = self.current_model();
+        let current_model = self.current_model().clone();
         match role.model_id() {
             Some(model_id) => {
                 if current_model.id() != model_id {
                     let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
-                    role.set_model(&model);
+                    role.set_model(model);
                 } else {
                     role.set_model(current_model);
                 }
             }
-            None => role.set_model(current_model),
+            None => {
+                role.set_model(current_model);
+                if role.temperature().is_none() {
+                    role.set_temperature(self.temperature);
+                }
+                if role.top_p().is_none() {
+                    role.set_top_p(self.top_p);
+                }
+            }
         }
         Ok(role)
     }
@@ -1228,7 +1236,7 @@ impl Config {
         if !need_compress {
             return;
         }
-        let color = if config.read().light_theme {
+        let color = if config.read().light_theme() {
             nu_ansi_term::Color::LightGray
         } else {
             nu_ansi_term::Color::DarkGray
@@ -1270,7 +1278,7 @@ impl Config {
             .clone()
             .unwrap_or_else(|| SUMMARY_PROMPT.into());
         if let Some(session) = config.write().session.as_mut() {
-            session.compress(format!("{}{}", summary_prompt, summary));
+            session.compress(format!("{summary_prompt}{summary}"));
         }
         config.write().discontinuous_last_message();
         Ok(())
@@ -1294,7 +1302,7 @@ impl Config {
         if !need_autoname {
             return;
         }
-        let color = if config.read().light_theme {
+        let color = if config.read().light_theme() {
             nu_ansi_term::Color::LightGray
         } else {
             nu_ansi_term::Color::DarkGray
@@ -1620,7 +1628,7 @@ impl Config {
             None => return Ok(()),
         };
 
-        let err_msg = || format!("Invalid prelude '{}", prelude);
+        let err_msg = || format!("Invalid prelude '{prelude}");
         match prelude.split_once(':') {
             Some(("role", name)) => {
                 self.use_role(name).with_context(err_msg)?;
@@ -1748,7 +1756,7 @@ impl Config {
                             self.list_autoname_sessions()
                                 .iter()
                                 .rev()
-                                .map(|v| format!("_/{}", v))
+                                .map(|v| format!("_/{v}"))
                                 .collect::<Vec<String>>(),
                         )
                     } else {
@@ -1896,9 +1904,13 @@ impl Config {
         Ok(models_override.list)
     }
 
+    pub fn light_theme(&self) -> bool {
+        matches!(self.theme.as_deref(), Some("light"))
+    }
+
     pub fn render_options(&self) -> Result<RenderOptions> {
         let theme = if self.highlight {
-            let theme_mode = if self.light_theme { "light" } else { "dark" };
+            let theme_mode = if self.light_theme() { "light" } else { "dark" };
             let theme_filename = format!("{theme_mode}.tmTheme");
             let theme_path = Self::local_path(&theme_filename);
             if theme_path.exists() {
@@ -1906,10 +1918,10 @@ impl Config {
                     .with_context(|| format!("Invalid theme at '{}'", theme_path.display()))?;
                 Some(theme)
             } else {
-                let theme = if self.light_theme {
-                    bincode::deserialize_from(LIGHT_THEME).expect("Invalid builtin light theme")
+                let theme = if self.light_theme() {
+                    decode_bin(LIGHT_THEME).context("Invalid builtin light theme")?
                 } else {
-                    bincode::deserialize_from(DARK_THEME).expect("Invalid builtin dark theme")
+                    decode_bin(DARK_THEME).context("Invalid builtin dark theme")?
                 };
                 Some(theme)
             }
@@ -2045,7 +2057,7 @@ impl Config {
         output: &str,
         tool_results: &[ToolResult],
     ) -> Result<()> {
-        if output.is_empty() || !tool_results.is_empty() {
+        if !tool_results.is_empty() {
             return Ok(());
         }
         self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
@@ -2192,7 +2204,7 @@ impl Config {
         let config: Self = serde_yaml::from_str(&content)
             .map_err(|err| {
                 let err_msg = err.to_string();
-                let err_msg = if err_msg.starts_with(&format!("{}: ", CLIENTS_FIELD)) {
+                let err_msg = if err_msg.starts_with(&format!("{CLIENTS_FIELD}: ")) {
                     // location is incorrect, get rid of it
                     err_msg
                         .split_once(" at line")
@@ -2334,12 +2346,16 @@ impl Config {
         if *NO_COLOR {
             self.highlight = false;
         }
-        if let Some(Some(v)) = read_env_bool(&get_env_name("light_theme")) {
-            self.light_theme = v;
-        } else if !self.light_theme {
-            if let Ok(v) = env::var("COLORFGBG") {
-                if let Some(v) = light_theme_from_colorfgbg(&v) {
-                    self.light_theme = v
+        if self.highlight && self.theme.is_none() {
+            if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
+                self.theme = v;
+            } else if *IS_STDOUT_TERMINAL {
+                if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
+                    let theme = match color_scheme {
+                        ColorScheme::Dark => "dark",
+                        ColorScheme::Light => "light",
+                    };
+                    self.theme = Some(theme.into());
                 }
             }
         }
